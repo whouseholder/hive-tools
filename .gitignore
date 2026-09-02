@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Local runtime config (copy the .example.json and edit; keep secrets out of git)
+pressure-monitor/metadata_pressure_monitor.config.json
+
+# Generated outputs / reports / logs / state
+out/
+output/
+*_report_*.txt
+*_report_*.json
+orphans_*.csv
+orphans_*.json
+summary_*.txt
+audit_*.log
+findings_*.csv
+by_*.csv
+hot_tables_*.csv
+hive_orphan_cleanup_*.log
+
+# Monitor runtime state / event store
+*.jsonl
+state.json

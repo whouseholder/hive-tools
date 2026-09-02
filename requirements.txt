@@ -1,0 +1,9 @@
+# hive-tools has NO third-party Python dependencies.
+#
+# Both tools target Python 3.6+ and use only the standard library, so this file
+# is intentionally empty. There is nothing to `pip install`.
+#
+# External runtime dependencies (not Python packages) for orphan-cleanup:
+#   - beeline   (Hive CLI, present on any CDP edge/gateway node)
+#   - hdfs      (Hadoop CLI, same)
+#   - kinit     (Kerberos, for authenticating to a secured cluster)

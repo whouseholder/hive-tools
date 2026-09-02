@@ -1,0 +1,50 @@
+{
+  "interval_seconds": 300,
+  "alert_severity": "WARN",
+  "top_n": 20,
+  "state_file": "/var/lib/metadata_pressure_monitor/state.json",
+  "log_paths": [
+    "/var/log/hive/hadoop-cmf-hive-HIVEMETASTORE-*.log.out"
+  ],
+  "exclude_methods": [],
+  "window": {
+    "last": "24h",
+    "bucket": "1h"
+  },
+  "thresholds": {
+    "min_total_calls_for_findings": 500,
+    "method_share_pct": 25.0,
+    "token_share_pct": 35.0,
+    "ugi_share_pct": 25.0,
+    "ip_share_pct": 25.0,
+    "host_skew_pct": 60.0,
+    "loop_window_seconds": 60,
+    "loop_min_peak": 300,
+    "loop_min_rate_per_sec": 15.0,
+    "fetch_all_partitions_calls": 500,
+    "partition_write_calls": 500,
+    "stats_calls": 500,
+    "constraints_share_pct": 20.0,
+    "bucket_spike_factor": 3.0,
+    "slow_method_avg_ms": 1000,
+    "slow_method_min_calls": 50,
+    "top_findings_per_type": 8
+  },
+  "event_store": {
+    "enabled": true,
+    "path": "/var/lib/metadata_pressure_monitor/events.jsonl",
+    "retention_seconds": 86400,
+    "max_aggregation_window_seconds": 3600
+  },
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "use_tls": true,
+    "username": "monitor@example.com",
+    "password": "CHANGE_ME",
+    "from_addr": "hms-pressure-monitor@example.com",
+    "to_addrs": ["ops-team@example.com"],
+    "subject_prefix": "[HMS Pressure Monitor]"
+  }
+}
