@@ -1461,6 +1461,11 @@ def run_monitor(args):
 
 
 def main(argv=None):
+    if sys.version_info < (3, 6):
+        sys.stderr.write(
+            "WARNING: Python 3.6+ is recommended (RHEL 8 ships 3.6); "
+            "detected %s. Continuing, but behavior is unsupported.\n"
+            % ".".join(str(x) for x in sys.version_info[:3]))
     parser = build_parser()
     args = parser.parse_args(argv)
     setup_logging(args.verbose)

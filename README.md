@@ -56,8 +56,10 @@ cd orphan-cleanup
 # -> writes ./out/orphans_<ts>.csv (+ .json and a summary). Nothing is changed.
 ```
 
-To actually clean up later, review the report, then run `clean --execute` or
-`apply --report <file> --execute`. See the tool README for details.
+To actually clean up later, review the report, (optionally trim it,) then run
+`apply --report <file> --execute`. You will be shown an itemized plan and must
+type `yes`. By default **only EXTERNAL tables/partitions are touched** and
+**ACID/transactional tables are never dropped**. See the tool README for details.
 
 ---
 
@@ -95,10 +97,22 @@ hive-tools/
 
 - **Pressure Monitor** is strictly **read-only**. It never touches the cluster;
   it only reads logs and writes reports/alerts.
-- **Orphan Cleanup** defaults to **dry-run**. It only issues DML when you pass
-  `--execute`, re-verifies each object against storage immediately before a
-  DROP, and writes an audit log of every statement. It uses **standard Hive
-  DML** only - never raw `DELETE` against the metastore database.
+- **Orphan Cleanup** is conservative by default and designed for production:
+  - **Dry-run by default** - DML is only issued with `--execute`.
+  - **External-only by default** - dropping a MANAGED table deletes data, so
+    managed objects are skipped unless you pass `--allow-managed`.
+  - **ACID/transactional tables are never auto-dropped** (hard rule).
+  - **Positive proof of absence** - an object is dropped only when its parent
+    directory lists successfully *and* the object is genuinely missing; any
+    transient storage error is skipped, so an Isilon/NameNode blip can't
+    manufacture orphans.
+  - **Bulk-safety guard** - refuses to act on a suspiciously large set
+    (`--max-drops`, `--max-orphan-pct`) unless `--allow-bulk`, since that
+    usually signals a storage outage rather than real orphans.
+  - **Notify + confirm** - prints an itemized plan and requires you to type
+    `yes` (or pass `--yes` for automation); writes an audit log of every
+    statement. Uses **standard Hive DML** only - never raw `DELETE` against the
+    metastore database.
 
 ---
 

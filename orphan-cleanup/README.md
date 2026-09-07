@@ -12,12 +12,16 @@ object cascades away its rows in the metastore backing tables
 
 ## Requirements
 
-- A CDP edge/gateway node with `beeline` and `hdfs` on `PATH`.
-- Python 3.6+ (standard library only - nothing to install).
+- A CDP 7.1.9 edge/gateway node with `beeline` and `hdfs` on `PATH`.
+- **RHEL 8 compatible**: Python 3.6+ (RHEL 8 ships 3.6), standard library only -
+  nothing to install. Run as `./hive_orphan_cleanup.py` or `python3
+  hive_orphan_cleanup.py` (or `/usr/libexec/platform-python` on a minimal host).
 - A valid Kerberos ticket (`kinit`), or pass `--keytab`/`--principal` and the
   tool will `kinit` for you.
+- Uses Hive 3 `sys.*` metastore views (present in CDP 7.1.9), automatically
+  falling back to `SHOW`/`DESCRIBE` if `sys.*` is not reachable.
 
-## The 30-second version
+## The 30-second version (recommended: report -> review -> apply)
 
 ```bash
 # 1) See what's orphaned (READ-ONLY, changes nothing)
@@ -25,17 +29,23 @@ object cascades away its rows in the metastore backing tables
     --jdbc-url 'jdbc:hive2://hs2.example.com:10000/default;principal=hive/_HOST@REALM' \
     --output-dir ./out
 
-# 2) Review ./out/summary_<ts>.txt and ./out/orphans_<ts>.csv
+# 2) Review ./out/summary_<ts>.txt and ./out/orphans_<ts>.csv.
+#    Optionally open the CSV and delete any rows you do NOT want to act on.
 
-# 3a) Clean everything found (preview first, then execute)
-./hive_orphan_cleanup.py clean --output-dir ./out            # dry-run
-./hive_orphan_cleanup.py clean --output-dir ./out --execute --yes
+# 3) Clean exactly the rows in that (optionally trimmed) report.
+#    You'll be shown an itemized DROP plan and prompted to type 'yes'.
+./hive_orphan_cleanup.py apply --report ./out/orphans_<ts>.csv            # dry-run preview
+./hive_orphan_cleanup.py apply --report ./out/orphans_<ts>.csv --execute  # prompts for 'yes'
 
-# 3b) OR clean only the rows you keep in an edited report
-./hive_orphan_cleanup.py apply --report ./out/orphans_<ts>.csv --execute --yes
+# (Alternative) detect + clean in one shot, dry-run first:
+./hive_orphan_cleanup.py clean --output-dir ./out                        # dry-run preview
+./hive_orphan_cleanup.py clean --output-dir ./out --execute              # prompts for 'yes'
 ```
 
-Nothing is ever changed without `--execute`.
+Defaults are deliberately cautious: **dry-run** unless `--execute`;
+**EXTERNAL-only** (managed tables need `--allow-managed`); **ACID tables are
+never dropped**; and a **bulk-safety guard** stops suspiciously large runs.
+Options may be given after the subcommand (e.g. `report --jdbc-url ...`).
 
 ## Modes
 
@@ -52,10 +62,34 @@ Nothing is ever changed without `--execute`.
    `SHOW DATABASES` -> `SHOW TABLES` -> `DESCRIBE FORMATTED` / `SHOW PARTITIONS`.
 2. **Check storage** for each location with `hdfs dfs`, grouping partitions per
    table to minimize calls.
-3. **Classify** an object as orphaned only if its location is missing. The
-   `--require-parent-exists` heuristic (on by default) additionally requires the
-   parent directory to be reachable, so a transient Isilon/NameNode outage does
-   not produce mass false positives.
+3. **Classify** an object as orphaned only with **positive proof of absence**:
+   the parent directory must list successfully (`hdfs dfs -ls`) *and* the object
+   must genuinely not be in that listing. Because `hdfs dfs -test -e` returns the
+   same exit code for "missing" and for many transient errors, the tool never
+   relies on that alone (unless you explicitly pass `--no-require-parent-exists`).
+   Any indeterminate result - unreachable parent, transient Isilon/NameNode
+   error - is **skipped**, so an outage cannot manufacture orphans.
+
+## What the tool will and will not drop
+
+| Object | Default (`clean`/`apply`) | With `--allow-managed` |
+|--------|---------------------------|------------------------|
+| EXTERNAL table / partition, proven missing | **Dropped** (after confirm) | Dropped |
+| MANAGED table / partition, proven missing | **Skipped** (reported) | Dropped (after confirm) |
+| ACID / transactional table | **Never dropped** | **Never dropped** |
+| VIEW | Never touched | Never touched |
+| Location present or indeterminate | Never dropped | Never dropped |
+
+Dropping a MANAGED object deletes its data, so managed objects are opt-in; ACID
+tables are protected unconditionally.
+
+### Bulk-safety guard
+
+Before executing, the tool refuses to proceed if the actionable set is
+suspiciously large - more than `--max-drops` objects (default 500) or more than
+`--max-orphan-pct` of scanned tables (default 25%) - unless you pass
+`--allow-bulk`. A large orphan set almost always means a storage outage, not
+real orphans. This guard is independent of `--yes`.
 
 ## Reports
 
@@ -102,17 +136,26 @@ tool never issues raw `DELETE` against metastore tables.
 | `--beeline-path` / `--hdfs-path` | Override CLI binary locations. |
 | `--keytab` / `--principal` | Optional pre-run `kinit`. |
 | `--databases` / `--exclude-databases` / `--tables` / `--table-regex` | Scope the scan. |
-| `--require-parent-exists` / `--no-require-parent-exists` | Toggle the transient-outage safety heuristic (default on). |
+| `--require-parent-exists` / `--no-require-parent-exists` | Toggle positive parent-listing corroboration (default **on**; leave on in production). |
 | `--max-workers` | Parallel `hdfs` existence checks (default 8). |
 | `--execute` | Actually run DML (otherwise dry-run). |
-| `--yes` | Skip the interactive confirmation (required for cron/non-TTY). |
+| `--yes` | Skip the interactive `yes` prompt (needed for cron/non-TTY). Does **not** bypass the managed/ACID or bulk-safety gates. |
+| `--allow-managed` | Also act on MANAGED (non-ACID) objects. **Deletes data** for genuine orphans. Off by default. |
+| `--allow-bulk` | Override the bulk-safety guard. Use only after confirming storage is healthy. |
+| `--max-drops N` | Refuse to act on more than N objects unless `--allow-bulk` (default 500). |
+| `--max-orphan-pct P` | Refuse if more than P% of scanned tables look orphaned, unless `--allow-bulk` (default 25). |
+| `--confirm-each` | Prompt interactively before each per-table DROP batch. |
 | `--limit N` | Cap the number of per-table batches acted on. |
-| `--use-msck` | Use `MSCK REPAIR ... DROP PARTITIONS` per table instead of explicit `ALTER ... DROP PARTITION`. |
+| `--use-msck` | Use `MSCK REPAIR ... DROP PARTITIONS` per table. **Caution:** this drops *every* partition whose directory is currently missing, so a transient outage could drop many partitions. Prefer the default explicit `ALTER ... DROP PARTITION`. |
 
 Exit codes: `0` success, `1` runtime error, `2` some DML statements failed,
-`3` soft warning (empty report / aborted without `--yes`).
+`3` soft warning / stopped safely (empty report, aborted at the prompt, or the
+bulk-safety guard refused the run).
 
 ## Scheduling
+
+Schedule **reporting** only. Execution should stay a human-reviewed step, so a
+storage outage can never turn into an automated mass-drop.
 
 ```cron
 # Weekly Mon 02:00 read-only report
@@ -120,17 +163,27 @@ Exit codes: `0` success, `1` runtime error, `2` some DML statements failed,
     --keytab /etc/security/keytabs/hive.keytab --principal hive/edge01@REALM \
     --jdbc-url 'jdbc:hive2://hs2:10000/default;principal=hive/_HOST@REALM' \
     --output-dir /var/log/hms_orphans >> /var/log/hms_orphans/cron.log 2>&1
+```
 
-# Monthly 1st 03:00 execute, after human review of the weekly reports
-0 3 1 * * /opt/hive-tools/orphan-cleanup/hive_orphan_cleanup.py clean --execute --yes \
-    --keytab /etc/security/keytabs/hive.keytab --principal hive/edge01@REALM \
-    --output-dir /var/log/hms_orphans >> /var/log/hms_orphans/cron.log 2>&1
+Then, after a human reviews and trims the weekly report:
+
+```bash
+# --yes is required on a non-TTY; the managed/ACID and bulk-safety gates still apply.
+./hive_orphan_cleanup.py apply --report /var/log/hms_orphans/orphans_<ts>.csv --execute --yes \
+    --keytab /etc/security/keytabs/hive.keytab --principal hive/edge01@REALM
 ```
 
 ## Safety notes
 
-- Dry-run is the default; nothing changes without `--execute`.
-- Every object is re-verified against storage immediately before its DROP.
-- Dropping an **external** table removes only metadata; for an orphan the data
-  is already gone either way. Scope with `--databases`/`--tables` if unsure, and
-  use `--limit` on the first execute run to bound blast radius.
+- **Dry-run is the default**; nothing changes without `--execute`.
+- **EXTERNAL-only by default**; MANAGED objects require `--allow-managed`, and
+  **ACID/transactional tables are never dropped**.
+- Every object is re-verified against storage with **positive proof of absence**
+  immediately before its DROP; indeterminate results are skipped.
+- The **bulk-safety guard** stops runs that look like a storage outage
+  (`--max-drops`, `--max-orphan-pct`) unless `--allow-bulk`.
+- Before any execute you get an **itemized plan** and must type **`yes`**
+  (or pass `--yes`); every statement is written to `audit_<ts>.log`.
+- Scope with `--databases`/`--tables` if unsure, and use `--limit` on the first
+  execute run to bound blast radius. Prefer explicit partition drops over
+  `--use-msck`.
