@@ -60,8 +60,13 @@ Options may be given after the subcommand (e.g. `report --jdbc-url ...`).
 1. **Enumerate** all table and partition locations in one shot from the Hive 3
    `sys.*` views (`sys.TBLS`/`DBS`/`SDS`/`PARTITIONS`), falling back to
    `SHOW DATABASES` -> `SHOW TABLES` -> `DESCRIBE FORMATTED` / `SHOW PARTITIONS`.
-2. **Check storage** for each location with `hdfs dfs`, grouping partitions per
-   table to minimize calls.
+2. **Check storage** with `hdfs dfs`, batched by **parent directory**: every
+   unique parent (a database dir for tables, a table dir for partitions) is
+   listed **once** with `hdfs dfs -ls` and cached, shared across both tables and
+   partitions. Hundreds of tables in one database, or thousands of partitions
+   under one table, then cost a single listing instead of one probe per object -
+   which keeps load off the NameNode/Isilon on large, repeated runs. Listings
+   for distinct parents run in parallel (`--max-workers`).
 3. **Classify** an object as orphaned only with **positive proof of absence**:
    the parent directory must list successfully (`hdfs dfs -ls`) *and* the object
    must genuinely not be in that listing. Because `hdfs dfs -test -e` returns the

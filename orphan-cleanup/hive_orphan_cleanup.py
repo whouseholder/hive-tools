@@ -723,6 +723,7 @@ class Detector(object):
         self.hdfs = hdfs
         self.require_parent_exists = require_parent_exists
         self.max_workers = max_workers
+        self._children_cache = {}
 
     def detect(self, tables, partitions):
         """Return list[HiveObject] flagged orphaned, with reason populated.
@@ -736,61 +737,104 @@ class Detector(object):
         now = datetime.datetime.now().isoformat(timespec="seconds") \
             if _supports_timespec() else datetime.datetime.now().isoformat()
         orphans = []
+        # One directory listing per unique parent, shared across BOTH tables and
+        # partitions for this run. Hundreds of tables/partitions under the same
+        # db.db (or table) directory then cost a single `hdfs dfs -ls`, instead
+        # of one -test/-ls per object.
+        self._children_cache = {}
 
-        # --- Tables: check each table location ---
-        table_locations = [(t, t.location) for t in tables if t.location]
-        for obj, missing in self._check_paths(table_locations):
-            if missing is True:
-                obj.reason = "table location missing on storage"
-                obj.detected_at = now
-                orphans.append(obj)
-            elif missing is None:
-                LOG.debug("skip %s: storage indeterminate (transient?)", obj.location)
-
-        # --- Partitions: group by table, list table children once ---
-        by_table = defaultdict(list)
-        for p in partitions:
-            by_table[(p.db, p.table)].append(p)
-
-        for (db, tbl), plist in by_table.items():
-            # Try one directory listing of the parent(s) to avoid many -test calls.
-            parents = set(os.path.dirname(p.location.rstrip("/"))
-                          for p in plist if p.location)
-            children_cache = {}
-            for parent in parents:
-                children_cache[parent] = self.hdfs.list_children(parent)
-
-            to_probe = []
-            for p in plist:
-                if not p.location:
-                    # No location known (fallback path): probe directly later.
-                    to_probe.append(p)
+        # --- Tables: batch by parent dir (default), else per-path -test ---
+        if self.require_parent_exists:
+            root_probe = []
+            norm_parent = {}
+            for t in tables:
+                if not t.location:
                     continue
-                parent = os.path.dirname(p.location.rstrip("/"))
-                kids = children_cache.get(parent)
+                norm = t.location.rstrip("/")
+                parent = os.path.dirname(norm)
+                if not parent or parent == norm:
+                    root_probe.append(t)   # fs root / unparseable -> prove alone
+                else:
+                    norm_parent[t] = (norm, parent)
+            self._list_parents(set(p for _n, p in norm_parent.values()))
+            for t, (norm, parent) in norm_parent.items():
+                kids = self._children_cache.get(parent)
                 if kids is None:
-                    # parent listing failed/absent -> indeterminate. Only probe
-                    # individually when we are NOT requiring parent corroboration;
-                    # otherwise treat as "do not touch".
-                    if not self.require_parent_exists:
-                        to_probe.append(p)
-                    else:
+                    LOG.debug("skip %s: parent %s unreachable (indeterminate)",
+                              norm, parent)
+                    continue
+                if norm not in kids:
+                    t.reason = "table location missing on storage"
+                    t.detected_at = now
+                    orphans.append(t)
+            for obj, missing in self._check_paths([(t, t.location) for t in root_probe]):
+                if missing is True:
+                    obj.reason = "table location missing on storage"
+                    obj.detected_at = now
+                    orphans.append(obj)
+        else:
+            table_locations = [(t, t.location) for t in tables if t.location]
+            for obj, missing in self._check_paths(table_locations):
+                if missing is True:
+                    obj.reason = "table location missing on storage"
+                    obj.detected_at = now
+                    orphans.append(obj)
+                elif missing is None:
+                    LOG.debug("skip %s: storage indeterminate (transient?)", obj.location)
+
+        # --- Partitions: group by parent dir, list each once (shared cache) ---
+        by_parent = defaultdict(list)
+        no_loc = []
+        for p in partitions:
+            if not p.location:
+                no_loc.append(p)
+            else:
+                by_parent[os.path.dirname(p.location.rstrip("/"))].append(p)
+        self._list_parents(set(by_parent.keys()))
+
+        to_probe = list(no_loc)
+        for parent, plist in by_parent.items():
+            kids = self._children_cache.get(parent)
+            if kids is None:
+                # parent listing failed/absent -> indeterminate. Only probe
+                # individually when NOT requiring parent corroboration; otherwise
+                # treat as "do not touch".
+                if not self.require_parent_exists:
+                    to_probe.extend(plist)
+                else:
+                    for p in plist:
                         LOG.debug("skip partition %s: parent %s unreachable",
                                   p.location, parent)
-                    continue
+                continue
+            for p in plist:
                 if p.location.rstrip("/") not in kids:
                     p.reason = "partition location missing on storage"
                     p.detected_at = now
                     orphans.append(p)
 
-            # Individual probes for partitions we could not resolve via listing.
-            probe_locs = [(p, p.location) for p in to_probe if p.location]
-            for obj, missing in self._check_paths(probe_locs):
-                if missing is True:
-                    obj.reason = "partition location missing on storage"
-                    obj.detected_at = now
-                    orphans.append(obj)
+        # Individual probes for partitions we could not resolve via listing.
+        probe_locs = [(p, p.location) for p in to_probe if p.location]
+        for obj, missing in self._check_paths(probe_locs):
+            if missing is True:
+                obj.reason = "partition location missing on storage"
+                obj.detected_at = now
+                orphans.append(obj)
         return orphans
+
+    def _list_parents(self, parents):
+        """List each not-yet-cached parent dir once (in parallel), caching the
+        child set (or None if unreachable) in self._children_cache."""
+        todo = [p for p in parents if p and p not in self._children_cache]
+        if not todo:
+            return
+        if _HAVE_FUTURES and self.max_workers > 1 and len(todo) > 1:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+                fut = {ex.submit(self.hdfs.list_children, p): p for p in todo}
+                for f in as_completed(fut):
+                    self._children_cache[fut[f]] = f.result()
+        else:
+            for p in todo:
+                self._children_cache[p] = self.hdfs.list_children(p)
 
     def _is_missing(self, path):
         """Return True (proven absent), False (present), or None (indeterminate).

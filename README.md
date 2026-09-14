@@ -7,7 +7,7 @@ dependency-free Python tools:
 | Tool | What it does | Folder |
 |------|--------------|--------|
 | **Orphan Cleanup** | Finds and removes orphaned Hive tables/partitions (metadata whose storage is gone) via standard Hive DML, reducing metastore rows. | [`orphan-cleanup/`](orphan-cleanup/) |
-| **Metadata Pressure Monitor** | Analyzes HMS logs to find what is overloading the metastore/MySQL (hot methods, users, tables, loops) and prescribes fixes. | [`pressure-monitor/`](pressure-monitor/) |
+| **Metadata Pressure Monitor** | Analyzes HMS logs to find what is overloading the metastore/MySQL (hot methods, users, tables, loops), correlates methods to Hive operations and likely source queries/apps (with confidence), and prescribes fixes. Runs fast/incrementally and can fan out across all HMS nodes over SSH. | [`pressure-monitor/`](pressure-monitor/) |
 
 Both are **Python 3.6+ and use only the standard library** - no `pip install`,
 no virtualenv required. Copy a script to an edge node and run it.
@@ -41,7 +41,11 @@ cd pressure-monitor
 ```
 
 Gzipped logs, directories, and globs all work. No cluster connection needed -
-it just reads logs.
+it just reads logs. For repeated runs add `--state-dir <dir>` to parse only new
+log bytes each time; to cover the whole fleet without gathering logs, add
+`--hosts <h1,h2,...> --remote-paths '<glob>'` and each HMS node parses its own
+logs and returns an aggregate. See the [tool README](pressure-monitor/) for
+top-contributor and workload-correlation options.
 
 ### Orphan Cleanup - find orphaned objects (read-only)
 

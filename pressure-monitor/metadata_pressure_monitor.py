@@ -85,12 +85,20 @@ import logging
 import os
 import random
 import re
+import shlex
 import smtplib
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+try:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    _HAVE_FUTURES = True
+except ImportError:  # pragma: no cover - very old python
+    _HAVE_FUTURES = False
 
 LOG = logging.getLogger("metadata_pressure_monitor")
 
@@ -120,6 +128,23 @@ DBNAME_TBLNAME_RE = re.compile(r"dbName[=:](?P<db>\S+)\s+tbl(?:Name)?[=:](?P<tab
 
 WINDOW_RE = re.compile(r"^(?P<n>\d+)\s*(?P<u>[smhdw])$", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+# --- optional client-log correlation (HS2 / YARN / Spark) -------------------
+SPARK_TS_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})")
+HS2_EXEC_RE = re.compile(
+    r"(?i)Executing command\(queryId=(?P<qid>[^)]+)\):\s*(?P<sql>.+)$")
+HS2_COMPILE_RE = re.compile(
+    r"(?i)Compiling command\(queryId=(?P<qid>[^)]+)\):\s*(?P<sql>.+)$")
+HS2_USER_RE = re.compile(r"(?i)(?:\bend user=|\buser=|\bugi=)(?P<user>[^\s,;)]+)")
+YARN_APP_RE = re.compile(r"\bapplication_\d+_\d+\b")
+YARN_USER_RE = re.compile(
+    r"(?i)(?:submitted by user\s+|\bUSER=|\buser=|\bugi=)(?P<user>[^\s,;]+)")
+SPARK_UGI_RE = re.compile(r"ugi=(?P<user>[^\s(,)]+)")
+SQL_TABLE_RE = re.compile(
+    r"(?i)\b(?:msck\s+repair\s+table|alter\s+table|drop\s+table(?:\s+if\s+exists)?|"
+    r"create\s+(?:external\s+|temporary\s+)?table(?:\s+if\s+not\s+exists)?|"
+    r"truncate\s+table|insert\s+(?:into|overwrite)\s+(?:table\s+)?|"
+    r"analyze\s+table|from|join|into|update)\s+(?P<t>`?[\w]+`?(?:\.`?[\w]+`?)?)")
 
 
 # ----------------------------------------------------------------------------
@@ -189,14 +214,151 @@ def categorize(method):
 
 
 # ----------------------------------------------------------------------------
+# HMS method -> underlying Hive operation (best-effort inference)
+# ----------------------------------------------------------------------------
+# Maps the low-level metastore Thrift method to the SQL/DDL operation(s) that
+# most likely produced it. This connects "which API is hammering MySQL" to the
+# "actual workload pattern" (ALTER/DROP/CREATE TABLE, partition management, etc).
+_OP_EXACT = {
+    "create_table": "CREATE TABLE",
+    "create_table_with_environment_context": "CREATE TABLE",
+    "drop_table": "DROP TABLE",
+    "drop_table_with_environment_context": "DROP TABLE",
+    "truncate_table": "TRUNCATE TABLE",
+    "alter_table": "ALTER TABLE",
+    "alter_table_with_environment_context": "ALTER TABLE",
+    "alter_table_with_cascade": "ALTER TABLE",
+    "create_database": "CREATE DATABASE",
+    "drop_database": "DROP DATABASE",
+    "alter_database": "ALTER DATABASE",
+    "add_partition": "ALTER TABLE ADD PARTITION",
+    "add_partitions": "ALTER TABLE ADD PARTITION / dynamic-partition INSERT",
+    "add_partitions_pspec": "ALTER TABLE ADD PARTITION / dynamic-partition INSERT",
+    "append_partition": "ALTER TABLE ADD PARTITION",
+    "append_partition_by_name": "ALTER TABLE ADD PARTITION",
+    "drop_partition": "ALTER TABLE DROP PARTITION / MSCK DROP",
+    "drop_partition_by_name": "ALTER TABLE DROP PARTITION",
+    "drop_partitions": "ALTER TABLE DROP PARTITION (batch) / MSCK",
+    "rename_partition": "ALTER TABLE ... RENAME PARTITION",
+    "exchange_partition": "ALTER TABLE EXCHANGE PARTITION",
+    "exchange_partitions": "ALTER TABLE EXCHANGE PARTITION",
+    "alter_partition": "ALTER TABLE ... PARTITION (or stats autogather write-back)",
+    "alter_partitions": "ALTER TABLE ... PARTITION (batch) / stats autogather",
+    "get_partitions_by_expr": "SELECT w/ partition pruning (get_partitions_by_expr)",
+    "get_partitions_by_filter": "SELECT w/ partition pruning (get_partitions_by_filter)",
+    "get_partitions_spec_by_expr": "SELECT w/ partition pruning",
+    "get_num_partitions_by_expr": "SELECT w/ partition pruning (count)",
+    "get_partition": "SELECT / partition lookup",
+    "get_partition_with_auth": "SELECT / partition lookup",
+    "get_partition_by_name": "SELECT / partition lookup",
+    "get_table": "query compile / table open (SELECT or DDL metadata)",
+    "get_table_objects_by_name": "query compile (multi-table open)",
+    "get_table_req": "query compile / table open",
+    "get_database": "USE / database metadata lookup",
+    "get_functions": "function-registry lookup (query compile)",
+    "get_config_value": "client/session config negotiation",
+    "flushcache": "cache flush (compaction/txn housekeeping)",
+    "msck": "MSCK REPAIR TABLE",
+}
+
+
+def hive_operation(method):
+    """Return an inferred Hive operation label for a canonical HMS method."""
+    if not method:
+        return ""
+    m = method.lower()
+    if m in _OP_EXACT:
+        return _OP_EXACT[m]
+    cat = categorize(method)
+    if cat == CAT_AUTH:
+        return "authentication (delegation token fetch)"
+    if cat == CAT_CONSTRAINTS:
+        return "table open -> constraint fetch (implicit in Hive 3 get_table)"
+    if cat == CAT_STATS:
+        return "ANALYZE / statistics fetch or autogather"
+    if cat == CAT_PARTITION_WRITE:
+        return "partition write (ADD/DROP/ALTER PARTITION)"
+    if cat == CAT_PARTITION_READ:
+        if "get_partitions" in m or "get_partition_names" in m:
+            return "SELECT / unfiltered partition listing"
+        return "SELECT / partition metadata"
+    if cat == CAT_DDL:
+        return "DDL (CREATE/DROP/ALTER)"
+    if m.startswith("get") and "database" in m:
+        return "database metadata lookup"
+    if cat == CAT_METADATA_READ:
+        return "metadata read (table/db/function open)"
+    return "other"
+
+
+# Compatible operation-class tokens used when matching client-log SQL to an
+# audited operation (loose, case-insensitive substring match against SQL text).
+_OP_SQL_TOKENS = {
+    "CREATE TABLE": ("create table",),
+    "DROP TABLE": ("drop table",),
+    "TRUNCATE TABLE": ("truncate",),
+    "ALTER TABLE": ("alter table",),
+    "CREATE DATABASE": ("create database", "create schema"),
+    "DROP DATABASE": ("drop database", "drop schema"),
+}
+
+
+# ----------------------------------------------------------------------------
 # Time helpers
 # ----------------------------------------------------------------------------
+# Per-second epoch cache. Consecutive log lines overwhelmingly share the same
+# 'YYYY-MM-DD HH:MM:SS' second, so caching that -> epoch conversion turns the
+# hot path into an int-slice + dict lookup and avoids datetime.strptime (which
+# is ~5-10x slower per call and dominates when scanning millions of lines).
+_TS_CACHE = {}
+_TS_CACHE_CAP = 200000
+
+
+def _sec_to_epoch(sec_str):
+    """'YYYY-MM-DD HH:MM:SS' -> local epoch seconds (matches datetime.timestamp)."""
+    return time.mktime((
+        int(sec_str[0:4]), int(sec_str[5:7]), int(sec_str[8:10]),
+        int(sec_str[11:13]), int(sec_str[14:16]), int(sec_str[17:19]),
+        0, 0, -1))
+
+
 def parse_ts(line):
+    """Fast path parse of a leading 'YYYY-MM-DD HH:MM:SS,mmm' timestamp.
+
+    Falls back to the regex for any non-standard shape. Returns epoch seconds
+    (float) or None.
+    """
+    # Cheap structural check for the fixed-width prefix before doing any work.
+    if (len(line) >= 23 and line[4] == "-" and line[7] == "-"
+            and line[10] == " " and line[13] == ":" and line[16] == ":"
+            and line[19] == ","):
+        sec_str = line[0:19]
+        ms_str = line[20:23]
+        base = _TS_CACHE.get(sec_str)
+        if base is None:
+            try:
+                base = _sec_to_epoch(sec_str)
+            except (ValueError, OverflowError):
+                return None
+            if len(_TS_CACHE) < _TS_CACHE_CAP:
+                _TS_CACHE[sec_str] = base
+        try:
+            return base + int(ms_str) / 1000.0
+        except ValueError:
+            return base
+    # Fallback: regex (handles unexpected leading whitespace, etc.)
     m = TS_RE.match(line)
     if not m:
         return None
-    dt = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-    return dt.timestamp() + int(m.group(2)) / 1000.0
+    base = _TS_CACHE.get(m.group(1))
+    if base is None:
+        try:
+            base = _sec_to_epoch(m.group(1))
+        except (ValueError, OverflowError):
+            return None
+        if len(_TS_CACHE) < _TS_CACHE_CAP:
+            _TS_CACHE[m.group(1)] = base
+    return base + int(m.group(2)) / 1000.0
 
 
 def parse_window(spec):
@@ -419,6 +581,25 @@ class Timer(object):
         idx = min(len(s) - 1, int(round((pct / 100.0) * (len(s) - 1))))
         return s[idx]
 
+    def to_dict(self):
+        """Serialize for shipping/merging (bounded by the reservoir cap)."""
+        return {"count": self.count, "total": self.total, "max": self.max,
+                "seen": self._seen, "sample": self._sample}
+
+    def merge_dict(self, d):
+        """Merge another Timer's serialized form into this one."""
+        self.count += int(d.get("count", 0))
+        self.total += int(d.get("total", 0))
+        m = int(d.get("max", 0))
+        if m > self.max:
+            self.max = m
+        self._seen += int(d.get("seen", d.get("count", 0)))
+        incoming = d.get("sample") or []
+        if incoming:
+            combined = self._sample + list(incoming)
+            self._sample = (random.sample(combined, self._cap)
+                            if len(combined) > self._cap else combined)
+
 
 # ----------------------------------------------------------------------------
 # Analyzer: aggregate parsed events across all dimensions
@@ -447,11 +628,21 @@ class Analyzer(object):
         self.host_methods = defaultdict(Counter)
         self.by_bucket = Counter()
         self.bucket_methods = defaultdict(Counter)
+        self.bucket_ugi = defaultdict(Counter)        # bucket -> user counts
         self.by_table = Counter()
+
+        # method->operation attribution: op -> Counter((short_ugi, db.table))
+        self.op_calls = Counter()
+        self.op_sources = defaultdict(Counter)
+        self.ugi_ip = defaultdict(Counter)            # user -> client-ip counts
+        self._op_source_keys_full = False
+        self._op_source_count = 0
 
         # loop / repetition detection: key -> {bucket -> count}
         self._loop = defaultdict(lambda: defaultdict(int))
         self._loop_keys_full = False
+        # populated only when merging pre-aggregated partials (distributed mode)
+        self._merged_loop = {}
 
     def _note_ts(self, ts):
         if self.min_ts is None or ts < self.min_ts:
@@ -480,11 +671,16 @@ class Analyzer(object):
         self.by_category_calls[cat] += 1
 
         short, principal, _realm = normalize_ugi(audit.get("ugi", ""))
+        ip = audit.get("ip", "")
+        table = audit.get("table", "")
+        fq = "{0}.{1}".format(audit.get("db", "") or "?", table) if table else ""
+
         if short:
             self.by_ugi[short] += 1
             self.ugi_methods[short][method] += 1
             self.ugi_principal[short][principal] += 1
-        ip = audit.get("ip", "")
+            if ip:
+                self.ugi_ip[short][ip] += 1
         if ip:
             self.by_ip[ip] += 1
         if host:
@@ -494,11 +690,24 @@ class Analyzer(object):
         b = bucket_key(ts, self.bucket_seconds)
         self.by_bucket[b] += 1
         self.bucket_methods[b][method] += 1
+        if short:
+            self.bucket_ugi[b][short] += 1
 
-        table = audit.get("table", "")
-        if table:
-            fq = "{0}.{1}".format(audit.get("db", "") or "?", table)
+        if fq:
             self.by_table[fq] += 1
+
+        # method -> operation attribution (bounded joint of who+what per op)
+        op = hive_operation(method)
+        if op:
+            self.op_calls[op] += 1
+            src_key = (short, fq)
+            bucket = self.op_sources[op]
+            if src_key in bucket or not self._op_source_keys_full:
+                if src_key not in bucket:
+                    self._op_source_count += 1
+                    if self._op_source_count >= self.track_key_cap:
+                        self._op_source_keys_full = True
+                bucket[src_key] += 1
 
         # loop tracking (bounded)
         lb = bucket_key(ts, self.loop_window_seconds)
@@ -514,7 +723,14 @@ class Analyzer(object):
         return max(1.0, self.max_ts - self.min_ts)
 
     def loop_peaks(self):
-        """Peak calls-in-window per (ugi,ip,method,table)."""
+        """Peak calls-in-window per (ugi,ip,method,table).
+
+        Uses locally-ingested buckets when available; when this Analyzer was
+        built by merging pre-aggregated partials (distributed mode) it returns
+        the merged peaks instead.
+        """
+        if not self._loop and self._merged_loop:
+            return list(self._merged_loop.values())
         peaks = []
         for (short, ip, method, table), buckets in self._loop.items():
             if not buckets:
@@ -528,6 +744,128 @@ class Analyzer(object):
                 "rate_per_sec": round(peak / float(self.loop_window_seconds), 2),
             })
         return peaks
+
+    def loop_peaks_top(self, n):
+        peaks = self.loop_peaks()
+        peaks.sort(key=lambda p: p.get("peak_in_window", 0), reverse=True)
+        return peaks[:n]
+
+    # ---- distributed / incremental support: mergeable partial aggregates ----
+    def to_partial(self, top_tables=3000, top_kv=25, loop_top=500, host_label=""):
+        """Serialize this Analyzer to a compact, JSON-safe, mergeable dict.
+
+        Ships pre-aggregated counts (never raw log lines). Wide maps are capped
+        so a partial stays small even for a very busy host.
+        """
+        return {
+            "v": 1,
+            "host_label": host_label,
+            "bucket_seconds": self.bucket_seconds,
+            "loop_window_seconds": self.loop_window_seconds,
+            "total_audit": self.total_audit,
+            "total_perf": self.total_perf,
+            "min_ts": self.min_ts,
+            "max_ts": self.max_ts,
+            "audit_by_method": dict(self.audit_by_method),
+            "perf_timer": {m: t.to_dict() for m, t in self.perf_timer.items()},
+            "by_category_calls": dict(self.by_category_calls),
+            "by_category_time": dict(self.by_category_time),
+            "by_ugi": dict(self.by_ugi),
+            "ugi_methods": {u: dict(c.most_common(top_kv))
+                            for u, c in self.ugi_methods.items()},
+            "ugi_principal": {u: dict(c.most_common(5))
+                              for u, c in self.ugi_principal.items()},
+            "by_ip": dict(self.by_ip),
+            "by_host": dict(self.by_host),
+            "host_methods": {h: dict(c.most_common(top_kv))
+                             for h, c in self.host_methods.items()},
+            "by_bucket": {str(b): c for b, c in self.by_bucket.items()},
+            "bucket_methods": {str(b): dict(c.most_common(top_kv))
+                               for b, c in self.bucket_methods.items()},
+            "bucket_ugi": {str(b): dict(c.most_common(top_kv))
+                           for b, c in self.bucket_ugi.items()},
+            "by_table": dict(self.by_table.most_common(top_tables)),
+            "op_calls": dict(self.op_calls),
+            "op_sources": {op: {(u + "\x1f" + t): c
+                                for (u, t), c in src.most_common(400)}
+                           for op, src in self.op_sources.items()},
+            "ugi_ip": {u: dict(c.most_common(10))
+                       for u, c in self.ugi_ip.items()},
+            "loop_peaks": self.loop_peaks_top(loop_top),
+        }
+
+    def merge_partial(self, d):
+        """Merge a partial produced by to_partial() into this Analyzer."""
+        self.total_audit += int(d.get("total_audit", 0))
+        self.total_perf += int(d.get("total_perf", 0))
+        mn, mx = d.get("min_ts"), d.get("max_ts")
+        if mn is not None:
+            self.min_ts = mn if self.min_ts is None else min(self.min_ts, mn)
+        if mx is not None:
+            self.max_ts = mx if self.max_ts is None else max(self.max_ts, mx)
+        for m, c in d.get("audit_by_method", {}).items():
+            self.audit_by_method[m] += c
+        for m, td in d.get("perf_timer", {}).items():
+            self.perf_timer[m].merge_dict(td)
+        for k, c in d.get("by_category_calls", {}).items():
+            self.by_category_calls[k] += c
+        for k, c in d.get("by_category_time", {}).items():
+            self.by_category_time[k] += c
+        for k, c in d.get("by_ugi", {}).items():
+            self.by_ugi[k] += c
+        for u, mm in d.get("ugi_methods", {}).items():
+            for m, c in mm.items():
+                self.ugi_methods[u][m] += c
+        for u, pp in d.get("ugi_principal", {}).items():
+            for p, c in pp.items():
+                self.ugi_principal[u][p] += c
+        for k, c in d.get("by_ip", {}).items():
+            self.by_ip[k] += c
+        # Host attribution: if the shard reported no per-host breakdown (remote
+        # filenames without the host token), attribute it to its ssh label.
+        by_host = d.get("by_host") or {}
+        host_methods = d.get("host_methods") or {}
+        if not by_host and d.get("host_label"):
+            by_host = {d["host_label"]: int(d.get("total_audit", 0))}
+            host_methods = {d["host_label"]: dict(d.get("audit_by_method", {}))}
+        for k, c in by_host.items():
+            self.by_host[k] += c
+        for h, mm in host_methods.items():
+            for m, c in mm.items():
+                self.host_methods[h][m] += c
+        for b, c in d.get("by_bucket", {}).items():
+            self.by_bucket[int(b)] += c
+        for b, mm in d.get("bucket_methods", {}).items():
+            for m, c in mm.items():
+                self.bucket_methods[int(b)][m] += c
+        for b, mm in d.get("bucket_ugi", {}).items():
+            for u, c in mm.items():
+                self.bucket_ugi[int(b)][u] += c
+        for tb, c in d.get("by_table", {}).items():
+            self.by_table[tb] += c
+        for op, c in d.get("op_calls", {}).items():
+            self.op_calls[op] += c
+        for op, src in d.get("op_sources", {}).items():
+            dst = self.op_sources[op]
+            for key, c in src.items():
+                u, _sep, t = key.partition("\x1f")
+                dst[(u, t)] += c
+        for u, mm in d.get("ugi_ip", {}).items():
+            for ip, c in mm.items():
+                self.ugi_ip[u][ip] += c
+        win = self.loop_window_seconds or int(d.get("loop_window_seconds", 60)) or 60
+        for pk in d.get("loop_peaks", []):
+            key = (pk.get("ugi", ""), pk.get("ip", ""),
+                   pk.get("method", ""), pk.get("table", ""))
+            cur = self._merged_loop.get(key)
+            if cur is None:
+                self._merged_loop[key] = dict(pk)
+            else:
+                cur["peak_in_window"] = max(cur.get("peak_in_window", 0),
+                                            pk.get("peak_in_window", 0))
+                cur["total"] = cur.get("total", 0) + pk.get("total", 0)
+                cur["rate_per_sec"] = round(
+                    cur["peak_in_window"] / float(win), 2)
 
 
 # ----------------------------------------------------------------------------
@@ -836,6 +1174,302 @@ def run_detectors(an, thresholds, top_n=20):
 
 
 # ----------------------------------------------------------------------------
+# Optional client-log correlation (HS2 / YARN / Spark) + source attribution
+# ----------------------------------------------------------------------------
+def parse_ts_any(line):
+    """parse_ts() plus a Spark 'yy/MM/dd HH:mm:ss' fallback (client logs)."""
+    ts = parse_ts(line)
+    if ts is not None:
+        return ts
+    m = SPARK_TS_RE.match(line)
+    if not m:
+        return None
+    yy, mo, dd, hh, mi, ss = (int(x) for x in m.groups())
+    try:
+        return time.mktime((2000 + yy, mo, dd, hh, mi, ss, 0, 0, -1))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _client_line_ts(raw):
+    if raw[:80].find("|") >= 0:
+        m = HOST_PREFIX_RE.match(raw)
+        if m:
+            return parse_ts_any(m.group("line"))
+    return parse_ts_any(raw)
+
+
+def truncate_sql(sql, n=280):
+    s = " ".join((sql or "").split())
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def extract_sql_table(sql):
+    m = SQL_TABLE_RE.search(sql or "")
+    if not m:
+        return ("", "")
+    ref = m.group("t").replace("`", "")
+    parts = [p for p in ref.split(".") if p]
+    if len(parts) >= 2:
+        return (parts[-2], parts[-1])
+    if len(parts) == 1:
+        return ("", parts[0])
+    return ("", "")
+
+
+def sql_operation(sql):
+    s = (sql or "").lower()
+    if "msck" in s:
+        return "MSCK REPAIR"
+    if "drop table" in s:
+        return "DROP TABLE"
+    if "create table" in s or "create external table" in s:
+        return "CREATE TABLE"
+    if "truncate table" in s:
+        return "TRUNCATE TABLE"
+    if "alter table" in s and "drop partition" in s:
+        return "ALTER TABLE DROP PARTITION"
+    if "alter table" in s and "add partition" in s:
+        return "ALTER TABLE ADD PARTITION"
+    if "alter table" in s:
+        return "ALTER TABLE"
+    if "insert " in s:
+        return "INSERT"
+    if "analyze table" in s:
+        return "ANALYZE"
+    if "create database" in s or "create schema" in s:
+        return "CREATE DATABASE"
+    if s.strip().startswith("select") or " from " in s:
+        return "SELECT"
+    return "OTHER"
+
+
+def _gate_hs2(line):
+    return "command(queryId=" in line
+
+
+def _gate_yarn(line):
+    return ("application_" in line and
+            ("ubmitted by user" in line or "ubmitting application" in line
+             or "USER=" in line))
+
+
+def _gate_spark(line):
+    return ("RepairTableCommand" in line
+            or "SparkListenerSQLExecutionStart" in line
+            or "SparkListenerApplicationStart" in line)
+
+
+def _parse_hs2(raw, ts):
+    m = HS2_EXEC_RE.search(raw) or HS2_COMPILE_RE.search(raw)
+    if not m:
+        return None
+    sql = m.group("sql").strip()
+    db, table = extract_sql_table(sql)
+    um = HS2_USER_RE.search(raw)
+    return {"ts": ts, "user": um.group("user") if um else "",
+            "query_id": m.group("qid"), "app_id": "",
+            "sql": truncate_sql(sql), "db": db, "table": table,
+            "operation": sql_operation(sql), "source": "HS2"}
+
+
+def _parse_yarn(raw, ts):
+    am = YARN_APP_RE.search(raw)
+    if not am:
+        return None
+    um = YARN_USER_RE.search(raw)
+    return {"ts": ts, "user": um.group("user") if um else "",
+            "query_id": "", "app_id": am.group(0), "sql": "",
+            "db": "", "table": "", "operation": "YARN application",
+            "source": "YARN"}
+
+
+def _parse_spark(raw, ts):
+    am = YARN_APP_RE.search(raw)
+    um = SPARK_UGI_RE.search(raw)
+    sql, op = "", "Spark job"
+    low = raw.lower()
+    for kw in ("msck repair", "alter table", "drop table", "insert ",
+               "create table"):
+        idx = low.find(kw)
+        if idx >= 0:
+            sql = raw[idx:].strip()
+            op = sql_operation(sql)
+            break
+    db, table = extract_sql_table(sql) if sql else ("", "")
+    return {"ts": ts, "user": um.group("user") if um else "",
+            "query_id": "", "app_id": am.group(0) if am else "",
+            "sql": truncate_sql(sql), "db": db, "table": table,
+            "operation": op, "source": "Spark"}
+
+
+def collect_client_ops(hs2_paths, yarn_paths, spark_paths, since_ts, until_ts,
+                       cap=200000):
+    """Parse optional HS2/YARN/Spark logs into normalized client-op records.
+
+    Only used when the operator supplies client-log paths; the monitor works
+    fine on HMS logs alone (attribution then falls back to observed ugi/table).
+    """
+    ops = []
+    lo = (since_ts - 900) if since_ts else None       # widen 15m each side
+    hi = (until_ts + 900) if until_ts else None
+
+    def ingest(paths, gate, parser):
+        for path in discover_files(paths or []):
+            for ts, raw in iter_windowed_raw(path, lo, hi, gate=gate,
+                                             ts_func=_client_line_ts):
+                rec = parser(raw, ts)
+                if rec:
+                    ops.append(rec)
+                    if len(ops) >= cap:
+                        return
+
+    ingest(hs2_paths, _gate_hs2, _parse_hs2)
+    ingest(yarn_paths, _gate_yarn, _parse_yarn)
+    ingest(spark_paths, _gate_spark, _parse_spark)
+    return ops
+
+
+def _index_client_ops(client_ops):
+    by_table = defaultdict(list)
+    for co in client_ops:
+        t = (co.get("table") or "").lower()
+        if t:
+            by_table[t].append(co)
+    return {"by_table": by_table, "all": client_ops}
+
+
+def _op_token_set(label):
+    s = (label or "").lower()
+    return set(kw for kw in ("create", "drop", "alter", "truncate", "insert",
+                             "select", "partition", "msck", "analyze", "add",
+                             "database") if kw in s)
+
+
+def _op_compatible(op_label, client_op_label):
+    return bool(_op_token_set(op_label) & _op_token_set(client_op_label))
+
+
+def _match_client(op_label, ugi, fq, index):
+    """Best client-op match for an audited (op, user, table) source."""
+    _db, _sep, table = fq.partition(".")
+    cands = index["by_table"].get(table.lower())
+    if not cands:
+        return None
+    nu = normalize_ugi(ugi)[0].lower() if ugi else ""
+    best, best_strength = None, -1.0
+    for co in cands:
+        strength, why = 0.40, "table"
+        if nu and co.get("user") and normalize_ugi(co["user"])[0].lower() == nu:
+            strength += 0.40
+            why += "+user"
+        if _op_compatible(op_label, co.get("operation", "")):
+            strength += 0.15
+            why += "+op"
+        if co.get("query_id") or co.get("app_id"):
+            strength += 0.05
+            why += "+id"
+        if strength > best_strength:
+            best_strength = strength
+            best = dict(co)
+            best["strength"] = min(1.0, strength)
+            best["why"] = why
+    if best:
+        best["match_source"] = ("HS2" if best.get("query_id")
+                                else ("YARN/Spark" if best.get("app_id")
+                                      else "client"))
+    return best
+
+
+def build_correlation(an, client_ops=None, top_ops_n=8, per_op=5):
+    """Correlate top HMS operations to likely sources (user/table -> query/app)
+    with a confidence score. Returns a list of per-operation dicts.
+
+    Confidence semantics (honest by design - HMS audit shares no id with HS2):
+      * user + table are read DIRECTLY from the HMS audit line, so attributing
+        an operation to a user/table is observed, not guessed; the score then
+        reflects how much of that operation the source explains (its share).
+      * supplying HS2/YARN/Spark logs lets us also name the likely query/app and
+        raises confidence, but a specific query link caps below 100 unless the
+        operation has a single unambiguous source (then 'CONFIRMED').
+    """
+    total = an.total_audit or 1
+    index = _index_client_ops(client_ops) if client_ops else None
+    result = []
+    for op, op_total in an.op_calls.most_common(top_ops_n):
+        cand = an.op_sources.get(op)
+        pairs = cand.most_common(per_op * 4) if cand else []
+        n_pairs = len(cand) if cand else 0
+        sources = []
+        for (ugi, fq), c in pairs:
+            share = (c / float(op_total)) if op_total else 0.0
+            dom_ip = (an.ugi_ip[ugi].most_common(1)[0][0]
+                      if ugi and an.ugi_ip.get(ugi) else "")
+            match = _match_client(op, ugi, fq, index) if index else None
+            conf = 100.0 * share
+            basis = ("HMS audit only (no client logs): user+table observed, "
+                     "exact query/app not correlated" if not index else
+                     "HMS audit: user+table observed; no client-log match")
+            qid = aid = sql = msrc = ""
+            if match:
+                qid, aid, sql = (match.get("query_id", ""),
+                                 match.get("app_id", ""), match.get("sql", ""))
+                msrc = match.get("match_source", "client")
+                conf += 15.0 * match["strength"]
+                basis = "HMS audit + %s correlation (%s)" % (msrc, match["why"])
+            confirmed = (share > 0.999 and n_pairs <= 1)
+            conf = int(round(min(100.0 if confirmed else 97.0, max(3.0, conf))))
+            sources.append({
+                "ugi": ugi or "?", "table": fq or "?", "calls": c,
+                "op_share_pct": round(100.0 * share, 1), "dom_ip": dom_ip,
+                "confidence": conf, "confirmed": confirmed,
+                "query_id": qid, "app_id": aid, "sql": sql,
+                "match_source": msrc, "basis": basis,
+            })
+        sources.sort(key=lambda s: (s["confidence"], s["calls"]), reverse=True)
+        result.append({
+            "operation": op, "calls": op_total,
+            "pct_of_all": round(100.0 * op_total / total, 1),
+            "n_source_pairs": n_pairs, "sources": sources[:per_op],
+        })
+    return result
+
+
+def build_top_contributors(an, top_n=10):
+    """Top contributors to pressure across dimensions; methods/users also carry
+    the peak bucket where they were most active."""
+    total = an.total_audit or 1
+
+    def peak_bucket(bucket_map, key):
+        best_b, best_c = None, 0
+        for b, ctr in bucket_map.items():
+            c = ctr.get(key, 0)
+            if c > best_c:
+                best_c, best_b = c, b
+        return best_b, best_c
+
+    methods = []
+    for m, c in an.audit_by_method.most_common(top_n):
+        pb, pc = peak_bucket(an.bucket_methods, m)
+        methods.append({"name": m, "calls": c, "pct": round(_pct(c, total), 1),
+                        "operation": hive_operation(m),
+                        "peak_bucket": human_ts(pb) if pb else "-",
+                        "peak_calls": pc})
+    users = []
+    for u, c in an.by_ugi.most_common(top_n):
+        pb, pc = peak_bucket(an.bucket_ugi, u)
+        users.append({"name": u, "calls": c, "pct": round(_pct(c, total), 1),
+                      "top_methods": dict(an.ugi_methods[u].most_common(3)),
+                      "peak_bucket": human_ts(pb) if pb else "-",
+                      "peak_calls": pc})
+    ips = [{"name": ip, "calls": c, "pct": round(_pct(c, total), 1)}
+           for ip, c in an.by_ip.most_common(top_n)]
+    tables = [{"name": t, "calls": c, "pct": round(_pct(c, total), 1)}
+              for t, c in an.by_table.most_common(top_n)]
+    return {"methods": methods, "users": users, "ips": ips, "tables": tables}
+
+
+# ----------------------------------------------------------------------------
 # Reporting
 # ----------------------------------------------------------------------------
 def _wrap(text, width, indent):
@@ -864,16 +1498,17 @@ class Reporter(object):
     def _p(self, name):
         return os.path.join(self.output_dir, name)
 
-    def write_all(self, an, findings, meta):
+    def write_all(self, an, findings, meta, contributors=None, correlation=None):
         paths = {}
         paths["txt"] = self._p("pressure_report_%s.txt" % self.ts)
         paths["json"] = self._p("pressure_report_%s.json" % self.ts)
-        self._write_csvs(an, findings, paths)
-        self._write_json(an, findings, meta, paths["json"])
-        summary = self._write_txt(an, findings, meta, paths["txt"])
+        self._write_csvs(an, findings, paths, contributors, correlation)
+        self._write_json(an, findings, meta, paths["json"], contributors, correlation)
+        summary = self._write_txt(an, findings, meta, paths["txt"],
+                                  contributors, correlation)
         return paths, summary
 
-    def _write_csvs(self, an, findings, paths):
+    def _write_csvs(self, an, findings, paths, contributors=None, correlation=None):
         total_calls = an.total_audit or 1
         total_time = sum(tm.total for tm in an.perf_timer.values()) or 1
 
@@ -954,7 +1589,44 @@ class Reporter(object):
             for f in findings:
                 w.writerow([f.severity, f.ftype, f.message, f.resolution])
 
-    def _write_json(self, an, findings, meta, path):
+        if contributors:
+            p = self._p("top_contributors_%s.csv" % self.ts)
+            paths["top_contributors"] = p
+            with open(p, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["dimension", "name", "calls", "pct_calls",
+                            "operation_or_top_methods", "peak_bucket", "peak_calls"])
+                for mm in contributors.get("methods", []):
+                    w.writerow(["method", mm["name"], mm["calls"], mm["pct"],
+                                mm["operation"], mm["peak_bucket"], mm["peak_calls"]])
+                for u in contributors.get("users", []):
+                    tm = ";".join("%s=%d" % (k, v) for k, v in u["top_methods"].items())
+                    w.writerow(["user", u["name"], u["calls"], u["pct"], tm,
+                                u["peak_bucket"], u["peak_calls"]])
+                for ipx in contributors.get("ips", []):
+                    w.writerow(["ip", ipx["name"], ipx["calls"], ipx["pct"], "", "", ""])
+                for t in contributors.get("tables", []):
+                    w.writerow(["table", t["name"], t["calls"], t["pct"], "", "", ""])
+
+        if correlation:
+            p = self._p("correlation_%s.csv" % self.ts)
+            paths["correlation"] = p
+            with open(p, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["operation", "op_calls", "pct_of_all", "rank",
+                            "confidence", "confirmed", "ugi", "table", "dom_ip",
+                            "op_share_pct", "query_id", "app_id",
+                            "match_source", "sql", "basis"])
+                for opx in correlation:
+                    for i, s in enumerate(opx["sources"], 1):
+                        w.writerow([opx["operation"], opx["calls"], opx["pct_of_all"],
+                                    i, s["confidence"], s["confirmed"], s["ugi"],
+                                    s["table"], s["dom_ip"], s["op_share_pct"],
+                                    s["query_id"], s["app_id"], s["match_source"],
+                                    s["sql"], s["basis"]])
+
+    def _write_json(self, an, findings, meta, path, contributors=None,
+                    correlation=None):
         total_calls = an.total_audit or 1
         total_time = sum(tm.total for tm in an.perf_timer.values())
         doc = {
@@ -988,13 +1660,23 @@ class Reporter(object):
             "top_ips": [{"ip": ip, "calls": c} for ip, c in an.by_ip.most_common(self.top_n)],
             "by_host": dict(an.by_host.most_common()),
             "hot_tables": [{"table": t, "calls": c} for t, c in an.by_table.most_common(self.top_n)],
+            "by_operation": [
+                {"operation": op, "calls": c,
+                 "pct_of_all": round(_pct(c, total_calls), 2)}
+                for op, c in an.op_calls.most_common(self.top_n)
+            ],
             "findings": [f.to_dict() for f in findings],
         }
+        if contributors:
+            doc["top_contributors"] = contributors
+        if correlation:
+            doc["workload_correlation"] = correlation
         with open(path, "w") as fh:
             json.dump(doc, fh, indent=2)
         LOG.info("wrote JSON report: %s", path)
 
-    def _write_txt(self, an, findings, meta, path):
+    def _write_txt(self, an, findings, meta, path, contributors=None,
+                   correlation=None):
         total_calls = an.total_audit or 1
         total_time = sum(tm.total for tm in an.perf_timer.values())
         L = []
@@ -1018,6 +1700,30 @@ class Reporter(object):
         info = sum(1 for f in findings if f.severity == "INFO")
         L.append("FINDINGS: %d CRITICAL, %d WARN, %d INFO" % (crit, warn, info))
         L.append("")
+
+        if contributors:
+            L.append("-" * 78)
+            L.append("TOP CONTRIBUTORS TO PRESSURE (this window)")
+            L.append("  By HMS method (-> inferred Hive operation):")
+            for mm in contributors["methods"][:5]:
+                L.append("    %-26s %9d %5.1f%%  peak %s (%d)  ~ %s"
+                         % (mm["name"][:26], mm["calls"], mm["pct"],
+                            mm["peak_bucket"], mm["peak_calls"], mm["operation"]))
+            L.append("  By user (Kerberos id):")
+            for u in contributors["users"][:5]:
+                tm = ", ".join("%s=%d" % (k, v) for k, v in u["top_methods"].items())
+                L.append("    %-18s %9d %5.1f%%  peak %s (%d)  [%s]"
+                         % (u["name"][:18], u["calls"], u["pct"],
+                            u["peak_bucket"], u["peak_calls"], tm))
+            L.append("  By client IP:")
+            for ipx in contributors["ips"][:5]:
+                L.append("    %-22s %9d %5.1f%%"
+                         % (ipx["name"][:22], ipx["calls"], ipx["pct"]))
+            L.append("  By table:")
+            for t in contributors["tables"][:5]:
+                L.append("    %-40s %9d %5.1f%%"
+                         % (t["name"][:40], t["calls"], t["pct"]))
+            L.append("")
 
         L.append("-" * 78)
         L.append("TOP HMS METHODS BY CALL VOLUME (audit)")
@@ -1067,13 +1773,55 @@ class Reporter(object):
                 L.append("  %-55s %10d" % (tbl[:55], c))
             L.append("")
 
+        if correlation:
+            L.append("-" * 78)
+            L.append("WORKLOAD CORRELATION  (HMS method -> Hive operation -> likely source)")
+            L.append("  Confidence = how strongly a source explains that operation's load.")
+            L.append("  user+table come straight from the HMS audit line (observed); the")
+            L.append("  query/app link needs HS2/YARN/Spark logs. 'CONFIRMED' only when a")
+            L.append("  single unambiguous source drives the operation.")
+            for opx in correlation:
+                if not opx["sources"]:
+                    continue
+                L.append("")
+                L.append("  %s   (%d calls, %.1f%% of all; %d distinct source pair(s))"
+                         % (opx["operation"], opx["calls"], opx["pct_of_all"],
+                            opx["n_source_pairs"]))
+                for i, s in enumerate(opx["sources"], 1):
+                    tag = "CONFIRMED" if s["confirmed"] else ("%d%%" % s["confidence"])
+                    who = s["ugi"] + ("@" + s["dom_ip"] if s["dom_ip"] else "")
+                    L.append("    #%d [%-9s] %s  on %s  (%d calls, %.1f%% of op)"
+                             % (i, tag, who[:34], s["table"][:34], s["calls"],
+                                s["op_share_pct"]))
+                    extra = []
+                    if s["query_id"]:
+                        extra.append("queryId=%s" % s["query_id"])
+                    if s["app_id"]:
+                        extra.append("app=%s" % s["app_id"])
+                    if s["match_source"]:
+                        extra.append("via %s" % s["match_source"])
+                    if extra:
+                        L.append("         " + ", ".join(extra))
+                    if s["sql"]:
+                        L.append("         sql: %s"
+                                 % _wrap(s["sql"], 64, "              "))
+                L.append("         basis: %s"
+                         % _wrap(opx["sources"][0]["basis"], 64, "                "))
+            L.append("")
+
         if len(an.by_bucket) > 1:
             L.append("-" * 78)
-            L.append("LOAD TREND (per %ds bucket)" % an.bucket_seconds)
+            L.append("LOAD TREND (per %ds bucket; annotated with top method + user)"
+                     % an.bucket_seconds)
             peak = max(an.by_bucket.values()) or 1
             for b, c in sorted(an.by_bucket.items()):
-                bar = "#" * int(40 * c / peak)
-                L.append("  %s %10d %s" % (human_ts(b), c, bar))
+                bar = "#" * int(28 * c / peak)
+                bm = an.bucket_methods.get(b)
+                bu = an.bucket_ugi.get(b)
+                topm = bm.most_common(1)[0][0] if bm else "-"
+                topu = bu.most_common(1)[0][0] if bu else "-"
+                L.append("  %s %9d %-28s m:%-22s u:%s"
+                         % (human_ts(b), c, bar, topm[:22], topu[:16]))
             L.append("")
 
         L.append("=" * 78)
@@ -1105,62 +1853,327 @@ class Reporter(object):
 # ----------------------------------------------------------------------------
 def _line_ts(raw):
     """Timestamp of a raw line, tolerating a 'host | ' prefix."""
-    m = HOST_PREFIX_RE.match(raw)
-    return parse_ts(m.group("line") if m else raw)
+    if raw[:80].find("|") >= 0:
+        m = HOST_PREFIX_RE.match(raw)
+        if m:
+            return parse_ts(m.group("line"))
+    return parse_ts(raw)
 
 
-def _peek_max_ts(files, sample_tail_bytes=2000000):
-    """Cheaply find the newest timestamp across files (tail of each)."""
-    max_ts = None
+def _relevant_raw(raw):
+    """Cheap substring gate run before any regex/timestamp work.
+
+    Only PERFLOG-close and audit lines matter; on real HMS role logs these are a
+    small fraction of all lines (the rest is INFO/DEBUG/stack traces), so this
+    single scan is the biggest single speedup.
+    """
+    return "</PERFLOG" in raw or ".audit:" in raw
+
+
+def newest_mtime(files):
+    """Cheap 'now' anchor for --last: the newest file mtime (no reading)."""
+    newest = 0.0
     for path in files:
         try:
-            if path.endswith(".gz"):
-                # gz: must stream; keep the last valid timestamp seen
-                last = None
-                for _ln, raw in iter_lines(path):
-                    ts = _line_ts(raw)
-                    if ts:
-                        last = ts
-                if last and (max_ts is None or last > max_ts):
-                    max_ts = last
-                continue
-            size = os.path.getsize(path)
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                if size > sample_tail_bytes:
-                    fh.seek(size - sample_tail_bytes)
-                    fh.readline()
-                for line in fh:
-                    ts = _line_ts(line)
-                    if ts and (max_ts is None or ts > max_ts):
-                        max_ts = ts
-        except (OSError, IOError):
+            mt = os.path.getmtime(path)
+        except OSError:
             continue
-    return max_ts
+        if mt > newest:
+            newest = mt
+    return newest
 
 
-def scan_files_into_analyzer(files, an, since_ts=None, until_ts=None, exclude_methods=None):
+def prune_files_by_mtime(files, since_ts, grace_seconds=3600):
+    """Drop files last modified before the window (they cannot contain in-window
+    lines). A generous grace guards against mtime/timezone skew."""
+    if not since_ts:
+        return files
+    kept = []
+    cutoff = since_ts - grace_seconds
+    for path in files:
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                kept.append(path)
+        except OSError:
+            kept.append(path)
+    return kept
+
+
+def _hms_gate(line):
+    return "</PERFLOG" in line or ".audit:" in line
+
+
+def _seek_to_since(fh, size, since_ts, grace_seconds=120, ts_func=_line_ts):
+    """Binary-search a byte offset just before `since_ts` in a chronological
+    plain-text log, so we don't read the (potentially huge) old head."""
+    target = since_ts - grace_seconds
+    lo, hi, best = 0, size, 0
+    while lo < hi:
+        mid = (lo + hi) // 2
+        fh.seek(mid)
+        fh.readline()  # discard the partial line at mid
+        pos = fh.tell()
+        ts = None
+        guard = 0
+        while guard < 200:
+            line = fh.readline()
+            if not line:
+                break
+            ts = ts_func(line.rstrip("\n"))
+            if ts is not None:
+                break
+            guard += 1
+        if ts is None:
+            hi = mid
+            continue
+        if ts < target:
+            best = pos
+            lo = fh.tell()
+        else:
+            hi = mid
+    return best
+
+
+def iter_windowed_raw(path, since_ts=None, until_ts=None, grace_seconds=120,
+                      gate=None, ts_func=_line_ts):
+    """Yield (ts, raw) for in-window, pre-filtered lines of a plain or gz file.
+
+    Applies the cheap substring `gate` first, binary-seeks to `since_ts` on large
+    plain files, and stops early once past `until_ts` (logs are chronological).
+    `gate`/`ts_func` default to HMS log semantics; pass client-log variants to
+    reuse the same fast path for HS2/YARN/Spark logs.
+    """
+    if gate is None:
+        gate = _hms_gate
+    is_gz = path.endswith(".gz")
+    try:
+        fh = open_text(path) if is_gz else open(
+            path, "r", encoding="utf-8", errors="replace")
+    except (OSError, IOError) as exc:
+        LOG.warning("cannot open %s: %s", path, exc)
+        return
+    with fh:
+        if not is_gz and since_ts:
+            try:
+                size = os.path.getsize(path)
+                if size > 1000000:  # only worth seeking on big files
+                    fh.seek(_seek_to_since(fh, size, since_ts, grace_seconds,
+                                           ts_func))
+            except (OSError, IOError):
+                pass
+        seen = False
+        for line in fh:
+            if not gate(line):
+                continue
+            raw = line.rstrip("\n")
+            ts = ts_func(raw)
+            if ts is None:
+                continue
+            if until_ts is not None and ts > until_ts + grace_seconds:
+                if seen:
+                    break
+                continue
+            if since_ts is not None and ts < since_ts:
+                continue
+            seen = True
+            yield ts, raw
+
+
+def scan_files_into_analyzer(files, an, since_ts=None, until_ts=None,
+                             exclude_methods=None, grace_seconds=120):
     exclude = set(exclude_methods or [])
     lines_parsed = 0
     for path in files:
         host = host_from_filename(path)
-        for _line_no, raw in iter_lines(path):
+        for _ts, raw in iter_windowed_raw(path, since_ts, until_ts, grace_seconds):
             perf, audit = parse_line(raw)
-            if perf:
-                ts = perf["ts"]
-                if (since_ts and ts < since_ts) or (until_ts and ts > until_ts):
-                    pass
-                elif perf["method"] not in exclude:
-                    an.ingest_perf(perf, host=host)
-                    lines_parsed += 1
-            if audit:
-                ts = audit["ts"]
-                if (since_ts and ts < since_ts) or (until_ts and ts > until_ts):
-                    continue
-                if audit["method"] in exclude:
-                    continue
+            if perf and perf["method"] not in exclude:
+                an.ingest_perf(perf, host=host)
+                lines_parsed += 1
+            elif audit and audit["method"] not in exclude:
                 an.ingest_audit(audit, host=host)
                 lines_parsed += 1
     return lines_parsed
+
+
+# ----------------------------------------------------------------------------
+# Incremental scan cache (opt-in for `report` via --state-dir)
+# ----------------------------------------------------------------------------
+class IncrementalStore(object):
+    """Parse only NEW bytes across runs and keep a compact, hour-sharded event
+    store so any window can be rebuilt without re-reading old log bytes.
+
+    Design notes:
+      * Per-file byte offsets are keyed by (device:inode); growth is read from
+        the stored offset, so a re-run over a live, appended log touches only the
+        delta.
+      * Parsed audit/PERFLOG events are written as short JSON to per-hour shard
+        files (ev-YYYYMMDDHH.jsonl); a windowed report reads only the shards that
+        overlap [since, until] instead of the whole history.
+      * gz / rotated files are immutable and ingested exactly once.
+      * Intended for append-mostly live logs. The authoritative mode remains a
+        full stateless scan (now fast); on in-place truncation the store re-syncs
+        from offset 0, which can double-count across that boundary once.
+    """
+
+    def __init__(self, state_dir, retention_days=3):
+        self.dir = state_dir
+        if not os.path.isdir(self.dir):
+            os.makedirs(self.dir)
+        self.offsets_path = os.path.join(self.dir, "offsets.json")
+        self.retention_seconds = int(retention_days) * 86400
+        try:
+            with open(self.offsets_path, "r", encoding="utf-8") as fh:
+                self.offsets = json.load(fh)
+        except (OSError, ValueError):
+            self.offsets = {}
+
+    def _shard(self, ts):
+        return os.path.join(
+            self.dir, "ev-%s.jsonl" % time.strftime("%Y%m%d%H", time.localtime(ts)))
+
+    @staticmethod
+    def _rec_audit(a, host):
+        return {"k": "a", "ts": a["ts"], "m": a["method"], "u": a.get("ugi", ""),
+                "i": a.get("ip", ""), "d": a.get("db", ""), "t": a.get("table", ""),
+                "h": host}
+
+    @staticmethod
+    def _rec_perf(p, host):
+        return {"k": "p", "ts": p["ts"], "m": p["method"],
+                "ms": p["duration_ms"], "h": host}
+
+    def sync(self, files):
+        """Read new bytes from each file, append events to hour shards, update
+        offsets. Returns the number of newly parsed events."""
+        writers = {}
+        parsed = 0
+
+        def wr(ts, rec):
+            sp = self._shard(ts)
+            fh = writers.get(sp)
+            if fh is None:
+                fh = writers[sp] = open(sp, "a", encoding="utf-8")
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+        try:
+            for path in files:
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                inode = "%s:%s" % (getattr(st, "st_dev", 0), st.st_ino)
+                size, mtime = st.st_size, int(st.st_mtime)
+                prev = self.offsets.get(path)
+                is_gz = path.endswith(".gz")
+                if is_gz:
+                    if prev and prev.get("size") == size and prev.get("mtime") == mtime:
+                        continue
+                    start = 0
+                elif prev and prev.get("inode") == inode and size >= int(prev.get("offset", 0)):
+                    start = int(prev.get("offset", 0))
+                else:
+                    start = 0
+                host = host_from_filename(path)
+                new_off = size
+
+                def handle(raw):
+                    perf, audit = parse_line(raw)
+                    if perf:
+                        wr(perf["ts"], self._rec_perf(perf, host))
+                        return 1
+                    if audit:
+                        wr(audit["ts"], self._rec_audit(audit, host))
+                        return 1
+                    return 0
+
+                if is_gz:
+                    for _ln, raw in iter_lines(path):
+                        if _hms_gate(raw):
+                            parsed += handle(raw)
+                else:
+                    try:
+                        fh = open(path, "r", encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    with fh:
+                        fh.seek(start)
+                        for line in fh:
+                            if _hms_gate(line):
+                                parsed += handle(line.rstrip("\n"))
+                        new_off = fh.tell()
+                self.offsets[path] = {"inode": inode, "size": size,
+                                      "mtime": mtime, "offset": new_off}
+        finally:
+            for fh in writers.values():
+                fh.close()
+        self._save()
+        return parsed
+
+    def load_window(self, an, since_ts, until_ts, exclude=None):
+        exclude = set(exclude or [])
+        for name in sorted(os.listdir(self.dir)):
+            if not (name.startswith("ev-") and name.endswith(".jsonl")):
+                continue
+            try:
+                base = time.mktime(time.strptime(name[3:-6], "%Y%m%d%H"))
+            except ValueError:
+                continue
+            if since_ts and base + 3600 < since_ts:
+                continue
+            if until_ts and base > until_ts + 3600:
+                continue
+            with open(os.path.join(self.dir, name), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    ts = r.get("ts")
+                    if ts is None:
+                        continue
+                    if since_ts and ts < since_ts:
+                        continue
+                    if until_ts and ts > until_ts:
+                        continue
+                    m = r.get("m", "")
+                    if m in exclude:
+                        continue
+                    if r.get("k") == "p":
+                        an.ingest_perf({"ts": ts, "method": m,
+                                        "duration_ms": r.get("ms", 0)},
+                                       host=r.get("h", ""))
+                    else:
+                        an.ingest_audit({"ts": ts, "method": m, "ugi": r.get("u", ""),
+                                         "ip": r.get("i", ""), "db": r.get("d", ""),
+                                         "table": r.get("t", "")}, host=r.get("h", ""))
+
+    def compact(self):
+        cutoff = time.time() - self.retention_seconds
+        for name in os.listdir(self.dir):
+            if not (name.startswith("ev-") and name.endswith(".jsonl")):
+                continue
+            try:
+                base = time.mktime(time.strptime(name[3:-6], "%Y%m%d%H"))
+            except ValueError:
+                continue
+            if base + 3600 < cutoff:
+                try:
+                    os.remove(os.path.join(self.dir, name))
+                except OSError:
+                    pass
+        self.offsets = {p: v for p, v in self.offsets.items() if os.path.exists(p)}
+        self._save()
+
+    def _save(self):
+        tmp = self.offsets_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.offsets, fh)
+        os.replace(tmp, self.offsets_path)
 
 
 # ----------------------------------------------------------------------------
@@ -1352,7 +2365,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
-    sub = p.add_subparsers(dest="mode", metavar="{report,monitor}")
+    sub = p.add_subparsers(dest="mode", metavar="{report,monitor,agg}")
     sub.required = True
 
     r = sub.add_parser("report", help="Ad-hoc: analyze historical logs and write a report")
@@ -1367,6 +2380,50 @@ def build_parser():
     r.add_argument("--loop-window", type=int, default=60,
                    help="Seconds window for loop/repetition detection (default 60)")
     r.add_argument("--output-dir", default=".", help="Directory for report outputs")
+    r.add_argument("--state-dir",
+                   help="Enable incremental mode: cache byte offsets + a compact "
+                        "hour-sharded event store here so re-runs parse only new bytes")
+    r.add_argument("--retention-days", type=int, default=3,
+                   help="Incremental store retention in days (default 3)")
+    # --- distributed fan-out across HMS hosts (no central log collection) ---
+    g = r.add_argument_group("distributed (analyze all HMS hosts remotely)")
+    g.add_argument("--hosts", help="Comma-separated HMS hostnames to query over ssh")
+    g.add_argument("--hosts-file", help="File with one HMS host per line (# comments ok)")
+    g.add_argument("--remote-paths", nargs="+",
+                   help="HMS log path(s)/glob(s) as they exist ON each remote host")
+    g.add_argument("--ssh", default="ssh", help="ssh binary/wrapper (default: ssh)")
+    g.add_argument("--ssh-user", help="ssh user for remote hosts")
+    g.add_argument("--ssh-opt", action="append", default=[],
+                   help="Extra ssh option, repeatable (e.g. --ssh-opt '-i /key')")
+    g.add_argument("--ssh-timeout", type=int, default=120,
+                   help="Per-host timeout seconds (default 120)")
+    g.add_argument("--remote-python", default="python3",
+                   help="python interpreter on remote hosts (default python3)")
+    g.add_argument("--parallel", type=int, default=8,
+                   help="Concurrent remote hosts (default 8)")
+    # --- workload correlation (map HMS load to users/queries/apps) ---------
+    c = r.add_argument_group("workload correlation (attribute load to sources)")
+    c.add_argument("--hs2-paths", nargs="+",
+                   help="HiveServer2 log file(s)/glob(s) for query correlation")
+    c.add_argument("--yarn-paths", nargs="+",
+                   help="YARN RM log file(s)/glob(s) for application correlation")
+    c.add_argument("--spark-paths", nargs="+",
+                   help="Spark driver/history log(s)/glob(s) for job correlation")
+    c.add_argument("--correlate-top", type=int, default=8,
+                   help="How many top operations to attribute (default 8)")
+    c.add_argument("--sources-per-op", type=int, default=5,
+                   help="Max likely sources listed per operation (default 5)")
+
+    a = sub.add_parser("agg", help="(internal) aggregate local logs; print JSON partial "
+                                   "to stdout for a distributed report")
+    a.add_argument("--paths", nargs="+", required=True)
+    a.add_argument("--last")
+    a.add_argument("--since")
+    a.add_argument("--until")
+    a.add_argument("--bucket", default="1h")
+    a.add_argument("--loop-window", type=int, default=60)
+    a.add_argument("--exclude-methods")
+    a.add_argument("--host-label", default="")
 
     m = sub.add_parser("monitor", help="Scheduled: incremental tail with alerts")
     m.add_argument("--config", required=True, help="Path to JSON config file")
@@ -1377,15 +2434,222 @@ def build_parser():
 
 
 def setup_logging(verbose):
+    # Log to stderr so stdout stays clean for data (the report summary and, in
+    # 'agg' worker mode, the JSON partial that the edge node parses).
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[logging.StreamHandler(sys.stderr)],
     )
+
+
+def _finish_report(an, args, meta, config, client_ops=None):
+    """Shared tail of report: detectors, contributors, correlation, outputs."""
+    findings = run_detectors(an, config.get("thresholds", {}), top_n=args.top)
+    contributors = build_top_contributors(an, top_n=args.top)
+    correlation = build_correlation(
+        an, client_ops=client_ops,
+        top_ops_n=getattr(args, "correlate_top", 8),
+        per_op=getattr(args, "sources_per_op", 5))
+    reporter = Reporter(args.output_dir, top_n=args.top)
+    paths_out, summary = reporter.write_all(an, findings, meta,
+                                            contributors, correlation)
+    print(summary)
+    LOG.info("reports: %s", ", ".join(sorted(set(paths_out.values()))))
+    return (EXIT_FINDINGS
+            if any(f.severity in ("WARN", "CRITICAL") for f in findings)
+            else EXIT_OK)
+
+
+# ---- distributed fan-out (each HMS host aggregates its own logs) -----------
+def parse_hosts(hosts_arg, hosts_file):
+    hosts = []
+    if hosts_arg:
+        hosts += [h.strip() for h in hosts_arg.split(",") if h.strip()]
+    if hosts_file:
+        try:
+            with open(hosts_file, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        hosts.append(line)
+        except OSError as exc:
+            LOG.error("cannot read --hosts-file %s: %s", hosts_file, exc)
+    seen, out = set(), []
+    for h in hosts:
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
+def _ssh_base(args):
+    base = [args.ssh or "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    for opt in (args.ssh_opt or []):
+        base += shlex.split(opt)
+    return base
+
+
+def run_remote_agg(host, args, script_path, worker_args, script_bytes):
+    """SSH to one host, run this same script in 'agg' mode over the host's local
+    logs (program fed on stdin: `python3 - agg ...`), return its JSON partial."""
+    target = "%s@%s" % (args.ssh_user, host) if args.ssh_user else host
+    remote_cmd = (args.remote_python or "python3") + " - " + \
+        " ".join(shlex.quote(a) for a in worker_args)
+    cmd = _ssh_base(args) + [target, remote_cmd]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(input=script_bytes, timeout=args.ssh_timeout)
+    except OSError as exc:
+        LOG.warning("host %s: cannot launch ssh (%s)", host, exc)
+        return None
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        LOG.warning("host %s: timed out after %ss", host, args.ssh_timeout)
+        return None
+    if proc.returncode != 0:
+        LOG.warning("host %s: agg failed rc=%s: %s", host, proc.returncode,
+                    (err or b"").decode("utf-8", "replace").strip()[:300])
+        return None
+    text = (out or b"").decode("utf-8", "replace")
+    i = text.find("{")
+    if i < 0:
+        LOG.warning("host %s: no JSON partial returned", host)
+        return None
+    try:
+        return json.loads(text[i:])
+    except ValueError as exc:
+        LOG.warning("host %s: bad JSON partial (%s)", host, exc)
+        return None
+
+
+def run_report_distributed(args, hosts, bucket_seconds, exclude, config):
+    remote_paths = args.remote_paths or args.paths or config.get("remote_paths")
+    if isinstance(remote_paths, str):
+        remote_paths = [remote_paths]
+    if not remote_paths:
+        LOG.error("--hosts requires --remote-paths (the HMS log path/glob on each host)")
+        return EXIT_ERROR
+
+    # Resolve ONE window on the edge so every host uses the same interval
+    # (HMS hosts are NTP-synced). --last becomes an explicit --since for workers.
+    since_ts = parse_iso(args.since)
+    until_ts = parse_iso(args.until)
+    if args.last:
+        w = parse_window(args.last)
+        if not w:
+            LOG.error("bad --last value: %s", args.last)
+            return EXIT_ERROR
+        since_ts = time.time() - w
+
+    base_worker_args = ["agg", "--paths"] + list(remote_paths) + \
+        ["--bucket", args.bucket, "--loop-window", str(args.loop_window)]
+    if exclude:
+        base_worker_args += ["--exclude-methods", ",".join(exclude)]
+    if since_ts:
+        base_worker_args += ["--since", human_ts(since_ts)]
+    if until_ts:
+        base_worker_args += ["--until", human_ts(until_ts)]
+
+    script_path = os.path.abspath(__file__)
+    try:
+        with open(script_path, "rb") as fh:
+            script_bytes = fh.read()
+    except OSError as exc:
+        LOG.error("cannot read own script for shipping (%s): %s", script_path, exc)
+        return EXIT_ERROR
+
+    LOG.info("distributed: querying %d host(s), %d-way parallel, window %s -> %s",
+             len(hosts), args.parallel,
+             human_ts(since_ts) if since_ts else "-",
+             human_ts(until_ts) if until_ts else "now")
+
+    an = Analyzer(bucket_seconds=bucket_seconds, loop_window_seconds=args.loop_window)
+    ok, failed = 0, []
+
+    def work(host):
+        wargs = base_worker_args + ["--host-label", host]
+        return host, run_remote_agg(host, args, script_path, wargs, script_bytes)
+
+    if _HAVE_FUTURES and args.parallel > 1:
+        with ThreadPoolExecutor(max_workers=max(1, args.parallel)) as ex:
+            for host, partial in [f.result() for f in
+                                  as_completed([ex.submit(work, h) for h in hosts])]:
+                if partial is None:
+                    failed.append(host)
+                    continue
+                partial.setdefault("host_label", host)
+                an.merge_partial(partial)
+                ok += 1
+    else:
+        for h in hosts:
+            _host, partial = work(h)
+            if partial is None:
+                failed.append(h)
+                continue
+            partial.setdefault("host_label", h)
+            an.merge_partial(partial)
+            ok += 1
+
+    LOG.info("distributed: %d/%d host(s) returned data%s",
+             ok, len(hosts), (" (failed: %s)" % ", ".join(failed)) if failed else "")
+    if ok == 0:
+        LOG.error("no hosts returned data; check ssh connectivity, --ssh-user, "
+                  "--remote-python, and --remote-paths")
+        return EXIT_ERROR
+
+    meta = {"files_scanned": "%d HMS host(s), %d ok" % (len(hosts), ok),
+            "lines_parsed": an.total_audit + an.total_perf,
+            "since": human_ts(since_ts) if since_ts else None,
+            "until": human_ts(until_ts) if until_ts else None,
+            "excluded_methods": exclude,
+            "hosts_total": len(hosts), "hosts_ok": ok, "hosts_failed": failed}
+    return _finish_report(an, args, meta, config)
+
+
+def run_worker(args):
+    """'agg' mode: aggregate LOCAL logs and print one JSON partial to stdout.
+
+    This is what runs on each HMS host during a distributed report. It emits
+    only pre-aggregated counts (never raw log content) so partials stay tiny.
+    """
+    paths = args.paths
+    if isinstance(paths, str):
+        paths = [paths]
+    if not paths:
+        sys.stderr.write("agg: --paths is required\n")
+        return EXIT_ERROR
+    files = discover_files(paths)
+    since_ts = parse_iso(args.since)
+    until_ts = parse_iso(args.until)
+    if args.last:
+        w = parse_window(args.last)
+        if not w:
+            sys.stderr.write("agg: bad --last value\n")
+            return EXIT_ERROR
+        since_ts = (newest_mtime(files) or time.time()) - w
+    files = prune_files_by_mtime(files, since_ts)
+    bucket_seconds = parse_window(args.bucket) or 3600
+    exclude = [m.strip() for m in (args.exclude_methods or "").split(",") if m.strip()]
+    an = Analyzer(bucket_seconds=bucket_seconds, loop_window_seconds=args.loop_window)
+    scan_files_into_analyzer(files, an, since_ts=since_ts, until_ts=until_ts,
+                             exclude_methods=exclude)
+    sys.stdout.write(json.dumps(an.to_partial(host_label=args.host_label or "")))
+    sys.stdout.flush()
+    return EXIT_OK
 
 
 def run_report(args):
     config = load_config(args.config) if args.config else {}
+    bucket_seconds = parse_window(args.bucket) or 3600
+    exclude = [m.strip() for m in (args.exclude_methods or "").split(",") if m.strip()]
+
+    # Distributed mode: fan out to remote HMS hosts and merge their partials.
+    hosts = parse_hosts(getattr(args, "hosts", None), getattr(args, "hosts_file", None))
+    if hosts:
+        return run_report_distributed(args, hosts, bucket_seconds, exclude, config)
+
     paths = args.paths or config.get("log_paths")
     if isinstance(paths, str):
         paths = [paths]
@@ -1397,43 +2661,64 @@ def run_report(args):
     if not files:
         LOG.error("no files matched: %s", paths)
         return EXIT_WARN
-    LOG.info("scanning %d file(s)", len(files))
 
     since_ts = parse_iso(args.since)
     until_ts = parse_iso(args.until)
-    bucket_seconds = parse_window(args.bucket) or 3600
-    exclude = [m.strip() for m in (args.exclude_methods or "").split(",") if m.strip()]
-
     if args.last:
         w = parse_window(args.last)
         if not w:
             LOG.error("bad --last value: %s", args.last)
             return EXIT_ERROR
-        max_ts = _peek_max_ts(files)
-        if max_ts:
-            since_ts = max_ts - w
-            LOG.info("--last %s -> window from %s", args.last, human_ts(since_ts))
+        # Anchor on the newest file mtime (cheap: no reading).
+        anchor = newest_mtime(files) or time.time()
+        since_ts = anchor - w
+        LOG.info("--last %s -> window from %s (anchor %s)",
+                 args.last, human_ts(since_ts), human_ts(anchor))
 
     an = Analyzer(bucket_seconds=bucket_seconds, loop_window_seconds=args.loop_window)
-    lines = scan_files_into_analyzer(files, an, since_ts=since_ts,
-                                     until_ts=until_ts, exclude_methods=exclude)
+
+    if getattr(args, "state_dir", None):
+        # Incremental: parse only new bytes into a shard store, then rebuild the
+        # requested window from the store (fast on repeated/scheduled re-runs).
+        store = IncrementalStore(args.state_dir,
+                                 retention_days=getattr(args, "retention_days", 3))
+        new_events = store.sync(files)
+        LOG.info("incremental: parsed %d new event(s); rebuilding window from store",
+                 new_events)
+        store.load_window(an, since_ts, until_ts, exclude=exclude)
+        store.compact()
+        lines = an.total_audit + an.total_perf
+        n_scanned = len(files)
+    else:
+        # Skip files that cannot overlap the window (cheap mtime check).
+        scan_files = prune_files_by_mtime(files, since_ts)
+        if len(scan_files) != len(files):
+            LOG.info("scanning %d of %d file(s) (%d pruned as older than the window)",
+                     len(scan_files), len(files), len(files) - len(scan_files))
+        else:
+            LOG.info("scanning %d file(s)", len(scan_files))
+        lines = scan_files_into_analyzer(scan_files, an, since_ts=since_ts,
+                                         until_ts=until_ts, exclude_methods=exclude)
+        n_scanned = len(scan_files)
+
     if lines == 0:
         LOG.warning("no HMS audit/PERFLOG lines matched in the given window")
         return EXIT_WARN
 
-    thresholds = config.get("thresholds", {})
-    findings = run_detectors(an, thresholds, top_n=args.top)
+    # Optional: correlate to end-user queries/apps using client logs.
+    client_ops = None
+    if getattr(args, "hs2_paths", None) or getattr(args, "yarn_paths", None) \
+            or getattr(args, "spark_paths", None):
+        client_ops = collect_client_ops(args.hs2_paths, args.yarn_paths,
+                                        args.spark_paths, since_ts, until_ts)
+        LOG.info("correlation: parsed %d client op(s) from HS2/YARN/Spark logs",
+                 len(client_ops))
 
-    reporter = Reporter(args.output_dir, top_n=args.top)
-    meta = {"files_scanned": len(files), "lines_parsed": lines,
+    meta = {"files_scanned": n_scanned, "lines_parsed": lines,
             "since": human_ts(since_ts) if since_ts else None,
             "until": human_ts(until_ts) if until_ts else None,
             "excluded_methods": exclude}
-    paths_out, summary = reporter.write_all(an, findings, meta)
-
-    print(summary)
-    LOG.info("reports: %s", ", ".join(sorted(set(paths_out.values()))))
-    return EXIT_FINDINGS if any(f.severity in ("WARN", "CRITICAL") for f in findings) else EXIT_OK
+    return _finish_report(an, args, meta, config, client_ops=client_ops)
 
 
 def run_monitor(args):
@@ -1472,6 +2757,8 @@ def main(argv=None):
     try:
         if args.mode == "report":
             return run_report(args)
+        if args.mode == "agg":
+            return run_worker(args)
         if args.mode == "monitor":
             return run_monitor(args)
         parser.error("unknown mode: %s" % args.mode)
