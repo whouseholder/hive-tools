@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hive-tools - Overview</title>
+
+<!-- reveal.js core + light theme (from CDN; needs internet on first load) -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/theme/white.css" id="theme">
+
+<style>
+  :root { --accent:#1d6fb8; --accent2:#2e7d32; --warn:#b23b3b; --ink:#1f2933; }
+  .reveal { font-size: 30px; color: var(--ink); }
+  .reveal h1 { font-size: 1.9em; color: var(--accent); }
+  .reveal h2 { font-size: 1.15em; color: var(--accent); text-transform: none; margin-bottom: .35em; }
+  .reveal h3 { color: var(--ink); text-transform: none; }
+  .reveal section { text-align: left; }
+  .reveal section.center { text-align: center; }
+  .reveal ul { display: block; margin-left: 1em; }
+  .reveal li { margin: .18em 0; line-height: 1.25; }
+  .reveal small, .reveal .small { font-size: .62em; color:#52606d; }
+  .reveal .lead { font-size: .8em; color:#3e4c59; }
+
+  /* tables */
+  .reveal table { font-size: .62em; border-collapse: collapse; width: 100%; margin: .2em 0; }
+  .reveal th, .reveal td { border: 1px solid #cbd2d9; padding: 6px 10px; vertical-align: top; }
+  .reveal thead th { background: #eef3f8; color: var(--accent); }
+  .reveal tbody tr:nth-child(even) { background: #f7f9fb; }
+  .no { color: var(--accent2); font-weight: 700; }
+  .yes-danger { color: var(--warn); font-weight: 700; }
+
+  /* diagrams */
+  .reveal .mermaid { text-align: center; margin: .1em 0; }
+  .reveal .mermaid svg { max-height: 430px; height: auto; width: auto; max-width: 100%; }
+
+  /* layout helpers */
+  .cols { display: flex; gap: 28px; align-items: flex-start; }
+  .cols > div { flex: 1; }
+  .legend { font-size: .55em; color:#52606d; margin-top:.3em; }
+  .chip { display:inline-block; padding:1px 8px; border-radius:10px; font-size:.9em; }
+  .chip.read { background:#e6f2fb; color:#1d6fb8; }
+  .chip.write { background:#fdeaea; color:#b23b3b; }
+  .chip.opt { background:#eef0f2; color:#52606d; }
+  .footer { position: fixed; bottom: 8px; left: 14px; font-size: 13px; color:#9aa5b1; }
+  .tag { font-size:.5em; letter-spacing:.08em; color:#9aa5b1; text-transform:uppercase; }
+  .kbd { font-family: ui-monospace,Menlo,Consolas,monospace; background:#f1f5f9; border:1px solid #cbd2d9; border-radius:4px; padding:0 6px; font-size:.85em; }
+</style>
+</head>
+<body>
+<div class="reveal"><div class="slides">
+
+<!-- 1. TITLE -->
+<section class="center">
+  <p class="tag">CDP 7.1.9 (Hive 3) &bull; on-prem &bull; Isilon &bull; MySQL metastore</p>
+  <h1>hive-tools</h1>
+  <p class="lead">Keeping the <b>Hive Metastore</b> and its <b>MySQL backend</b> healthy.</p>
+  <p><span class="chip read">Orphan Cleanup</span> &nbsp; <span class="chip read">Metadata Pressure Monitor</span></p>
+  <p class="small">Two standalone Python tools (3.6+, standard library only).<br>
+     This deck: why they exist, what they do, and their limits. The repo README is the full guide.</p>
+  <p class="small">Navigate with <span class="kbd">&rarr;</span> <span class="kbd">&larr;</span> / <span class="kbd">Space</span>. Print to PDF with your browser.</p>
+</section>
+
+<!-- 2. WHY / PROBLEM -->
+<section>
+  <h2>Why these tools exist</h2>
+  <p class="lead">The metastore's MySQL DB is a shared, single-writer bottleneck. Two things degrade it:</p>
+  <ul>
+    <li><b>Row bloat</b> - data deleted straight off storage leaves <b>orphaned</b> table/partition
+        rows behind in MySQL. Millions of dead rows slow every plan, backup, and upgrade.</li>
+    <li><b>Call pressure</b> - badly-shaped workloads flood the HMS with API calls; each is a
+        MySQL round-trip, so metadata gets slow <b>for everyone</b>.</li>
+  </ul>
+  <pre class="mermaid">
+flowchart LR
+  B["Row bloat"] --> DB[("MySQL metastore")]
+  P["Call pressure"] --> DB
+  DB --> S["Slow for everyone"]
+  OC["Orphan Cleanup"] -. fixes .-> B
+  PM["Pressure Monitor"] -. diagnoses .-> P
+  </pre>
+</section>
+
+<!-- 3. TWO TOOLS AT A GLANCE -->
+<section>
+  <h2>The two tools at a glance</h2>
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th><th>Changes the cluster?</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>Orphan Cleanup</b><br><span class="small">hive_orphan_cleanup.py</span></td>
+        <td>Finds &amp; removes Hive tables/partitions whose <b>storage is gone</b>, using standard
+            Hive DML - shrinking metastore row counts on MySQL.</td>
+        <td><span class="chip write">Only with <span class="kbd">--execute</span></span><br>
+            <span class="small">read-only by default</span></td>
+      </tr>
+      <tr>
+        <td><b>Pressure Monitor</b><br><span class="small">metadata_pressure_monitor.py</span></td>
+        <td>Reads HMS logs to find <b>what/who</b> is overloading the metastore, correlates to Hive
+            operations &amp; likely queries/apps, and prescribes fixes.</td>
+        <td><span class="chip read">Never</span><br><span class="small">strictly read-only</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="small">Both are dependency-free: copy one script to an edge node and run it.</p>
+</section>
+
+<!-- 4. WHICH TOOL WHEN -->
+<section>
+  <h2>Which tool, when?</h2>
+  <div class="cols">
+    <div>
+      <pre class="mermaid">
+flowchart TD
+  Q{"What is the symptom?"}
+  Q -->|"Slow / overloaded HMS"| PM["Pressure Monitor"]
+  Q -->|"MySQL bloat; data gone"| OC["Orphan Cleanup"]
+  PM -->|"churn on dead data"| OC
+  OC -->|"still slow"| PM
+      </pre>
+    </div>
+    <div>
+      <h3>Not the right tool when...</h3>
+      <ul>
+        <li>You want to tune <b>MySQL</b> itself or change Cloudera Manager configs.</li>
+        <li>You want to find <b>unused</b> tables - orphan = storage <i>genuinely gone</i>, not idle.</li>
+        <li>You expect it to <b>apply</b> fixes - the monitor only <b>recommends</b>.</li>
+        <li>You want to reclaim <b>disk</b> - cleanup removes metadata, not data.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 5. REQUIREMENTS -->
+<section>
+  <h2>Requirements &amp; scope</h2>
+  <table>
+    <thead><tr><th>Need</th><th>Orphan Cleanup</th><th>Pressure Monitor</th></tr></thead>
+    <tbody>
+      <tr><td>Python</td><td colspan="2" style="text-align:center">3.6+ , <b>standard library only</b> (RHEL 8 friendly)</td></tr>
+      <tr><td>Cluster connection</td><td><span class="kbd">beeline</span> + <span class="kbd">hdfs</span> on an edge node</td><td class="no">None - reads log files</td></tr>
+      <tr><td>Auth</td><td>Kerberos ticket (or keytab/principal)</td><td class="no">None</td></tr>
+      <tr><td>Platform</td><td colspan="2" style="text-align:center">Built &amp; verified for CDP 7.1.9 / Hive 3 / Isilon / MySQL</td></tr>
+      <tr><td>Install</td><td colspan="2" style="text-align:center" class="no">Nothing - no pip, no virtualenv</td></tr>
+    </tbody>
+  </table>
+  <p class="small"><b>In scope:</b> metastore <i>metadata</i> health (row bloat + call pressure).
+     <b>Out of scope:</b> deleting user data, MySQL tuning, applying configs.</p>
+</section>
+
+<!-- 6. ARCHITECTURE / SYSTEMS -->
+<section>
+  <h2>Architecture - systems these tools touch</h2>
+  <pre class="mermaid">
+flowchart LR
+  subgraph Edge["CDP edge node"]
+    OC["Orphan Cleanup"]
+    PM["Pressure Monitor"]
+  end
+  OC -->|"read: enumerate"| HS2["HiveServer2"]
+  OC ==>|"DROP DML (--execute)"| HS2
+  HS2 --> HMS["Hive Metastore"] --> DB[("MySQL")]
+  OC -->|"hdfs -ls (read)"| ISI[("Isilon / HDFS")]
+  PM -->|"read logs"| LOGS["HMS role logs"]
+  PM -. "SSH fan-out" .-> FLEET["All HMS nodes"]
+  PM -. correlate .-> CL["HS2 / YARN / Spark logs"]
+  </pre>
+  <p class="legend">
+    <b>Legend:</b> thin arrow = read-only &nbsp;|&nbsp;
+    <b>thick arrow = potentially mutating</b> (Orphan Cleanup, only with <span class="kbd">--execute</span>, only via Hive DML) &nbsp;|&nbsp;
+    dotted = optional. No tool ever issues raw <span class="kbd">DELETE</span> against MySQL.
+  </p>
+</section>
+
+<!-- 7. ORPHAN: WHAT IT DOES / MODES -->
+<section>
+  <h2>Orphan Cleanup - what it does</h2>
+  <p class="lead">Three modes; the recommended flow is <b>report &rarr; review &rarr; apply</b>.</p>
+  <table>
+    <thead><tr><th>Mode</th><th>What it does</th><th>Mutates?</th></tr></thead>
+    <tbody>
+      <tr><td><span class="kbd">report</span></td><td>Enumerate HMS, check storage, write CSV + JSON + summary.</td><td class="no">No</td></tr>
+      <tr><td><span class="kbd">clean</span></td><td>Detect <b>and</b> clean. Dry-run by default.</td><td>With <span class="kbd">--execute</span></td></tr>
+      <tr><td><span class="kbd">apply</span></td><td>Clean exactly the rows in a prior (trimmed) report.</td><td>With <span class="kbd">--execute</span></td></tr>
+    </tbody>
+  </table>
+  <p class="small">Cleanup is standard Hive DML (<span class="kbd">DROP TABLE</span> /
+    <span class="kbd">ALTER TABLE ... DROP PARTITION</span>), which cascades away the backing rows in
+    <span class="kbd">TBLS</span>/<span class="kbd">PARTITIONS</span>/<span class="kbd">SDS</span>/... - the MySQL win.</p>
+</section>
+
+<!-- 8. ORPHAN: DETECTION -->
+<section>
+  <h2>Orphan Cleanup - how detection works</h2>
+  <div class="cols">
+    <div>
+      <pre class="mermaid">
+flowchart TD
+  S["List parent dir once<br/>(hdfs -ls, cached)"] --> C{"Parent listed OK?"}
+  C -->|"no - transient"| SKIP["SKIP: indeterminate"]
+  C -->|yes| P{"Object present?"}
+  P -->|yes| KEEP["Not an orphan"]
+  P -->|no| ORPH["Flag ORPHAN"]
+      </pre>
+    </div>
+    <div>
+      <h3>Positive proof of absence</h3>
+      <ul>
+        <li>An object is flagged <b>only</b> when its parent lists successfully <b>and</b> it is
+            genuinely missing.</li>
+        <li>Any <b>indeterminate</b> result (outage, NameNode blip) is <b>skipped</b> - a storage
+            hiccup cannot manufacture orphans.</li>
+        <li>Listings are batched <b>one per parent dir</b> and cached, keeping load off Isilon.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 9. ORPHAN: SAFETY MODEL -->
+<section>
+  <h2>Orphan Cleanup - safety model</h2>
+  <div class="cols">
+    <div>
+      <pre class="mermaid">
+flowchart TD
+  O["Orphans"] --> RV["Re-verify (positive proof)"]
+  RV --> T{"Table type?"}
+  T -->|ACID| ACID["NEVER drop"]
+  T -->|MANAGED| M{"--allow-managed?"}
+  M -->|no| SK["SKIP (data-bearing)"]
+  M -->|yes| BULK
+  T -->|EXTERNAL| BULK{"Bulk guard OK?"}
+  BULK -->|"no - too many"| REF["REFUSE (likely outage)"]
+  BULK -->|yes| EX{"--execute?"}
+  EX -->|no| DRY["DRY-RUN: plan only"]
+  EX -->|yes| CF{"Type 'yes'?"}
+  CF -->|yes| DROP["DROP + audit log"]
+  CF -->|no| AB["Abort"]
+      </pre>
+    </div>
+    <div>
+      <table>
+        <thead><tr><th>Gate</th><th>Default</th><th>Loosen with</th></tr></thead>
+        <tbody>
+          <tr><td>Dry-run</td><td>on</td><td><span class="kbd">--execute</span></td></tr>
+          <tr><td>External-only</td><td>managed skipped</td><td><span class="kbd">--allow-managed</span></td></tr>
+          <tr><td>ACID protection</td><td>always</td><td class="yes-danger">none</td></tr>
+          <tr><td>Positive proof</td><td>always</td><td><span class="small">discouraged</span></td></tr>
+          <tr><td>Bulk guard</td><td>on</td><td><span class="kbd">--allow-bulk</span></td></tr>
+          <tr><td>Typed confirm</td><td>type <span class="kbd">yes</span></td><td><span class="kbd">--yes</span></td></tr>
+        </tbody>
+      </table>
+      <p class="legend">Loosening one gate never weakens the others: <span class="kbd">--yes</span>
+        skips only the keystroke; ACID is never droppable.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 10. MONITOR: WHAT IT ANSWERS -->
+<section>
+  <h2>Pressure Monitor - what it answers</h2>
+  <ul>
+    <li>Which HMS <b>methods</b> dominate call volume and total time?</li>
+    <li>Which <b>Hive operations</b> (DROP/ALTER/ADD PARTITION, CREATE/DROP TABLE, ANALYZE) drive them?</li>
+    <li>Which <b>users</b>, <b>client IPs</b>, <b>tables</b>, and <b>HMS hosts</b> contribute most?</li>
+    <li>How does load <b>trend over time</b> - where are the storms?</li>
+    <li>Which patterns look like <b>loops / repetitive calls</b> - and how to fix them?</li>
+  </ul>
+  <p class="small">For every finding it prints a concrete remediation: batching, partition pruning,
+     breaking loops, delegation-token store, stats tuning, ...</p>
+</section>
+
+<!-- 11. MONITOR: PIPELINE / MODES -->
+<section>
+  <h2>Pressure Monitor - how a run works</h2>
+  <div class="cols">
+    <div>
+      <pre class="mermaid">
+flowchart TD
+  D["Discover logs (.gz ok)"] --> PR["Prune by mtime"]
+  PR --> SK["Seek to window start"]
+  SK --> GT["Cheap substring gate"]
+  GT --> PS["Fast parse"]
+  PS --> AG["Aggregate"]
+  AG --> DE["Detect: findings + fixes"]
+  AG --> CO["Correlate to ops / sources"]
+  DE --> RP["Report"]
+  CO --> RP
+      </pre>
+      <p class="legend">Cheap &rarr; expensive, so most lines are discarded before any regex.</p>
+    </div>
+    <div>
+      <table>
+        <thead><tr><th>Mode</th><th>Use</th><th>Mutates?</th></tr></thead>
+        <tbody>
+          <tr><td><span class="kbd">report</span></td><td>Analyze a window; fan-out &amp; incremental options.</td><td class="no">No</td></tr>
+          <tr><td><span class="kbd">monitor</span></td><td>Scheduled tail with de-duplicated alerts.</td><td class="no">No</td></tr>
+          <tr><td><span class="kbd">agg</span></td><td>Per-node worker for SSH fan-out.</td><td class="no">No</td></tr>
+        </tbody>
+      </table>
+      <ul class="small">
+        <li><b>Fast:</b> a <span class="kbd">--last 1h</span> scan of a multi-GB log runs in well under a second.</li>
+        <li><b>Incremental</b> (<span class="kbd">--state-dir</span>): re-runs parse only new bytes.</li>
+        <li><b>Fleet</b> (<span class="kbd">--hosts</span>): each HMS node parses its own logs.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 12. MONITOR: INSIGHTS + CONFIDENCE -->
+<section>
+  <h2>Pressure Monitor - attributing the load</h2>
+  <p class="lead">Beyond "which method is hot", the report names <b>who/what to go fix</b>:
+     top contributors, and up to a <b>Top-5 likely source per operation</b> with a confidence score.</p>
+  <table>
+    <thead><tr><th>Evidence available</th><th>Confidence</th><th>Shown as</th></tr></thead>
+    <tbody>
+      <tr><td>user + table from HMS audit only</td><td>ranked, capped <b>&lt; 100%</b></td><td>"NN%" (guess)</td></tr>
+      <tr><td>+ client op matched on table <b>and</b> time</td><td>higher %</td><td>"NN%" + queryId / appId</td></tr>
+      <tr><td>single unambiguous driver</td><td><b>100%</b></td><td>CONFIRMED</td></tr>
+    </tbody>
+  </table>
+  <p class="small">Honest by design: HMS audit logs share no id with HS2, so attribution is a ranked
+     <b>guess</b> unless HS2/YARN/Spark logs confirm it. Treat the Top-5 as leads.</p>
+</section>
+
+<!-- 13. IMPLEMENTATION HIGHLIGHTS -->
+<section>
+  <h2>Implementation highlights</h2>
+  <div class="cols">
+    <div>
+      <h3>Built for production</h3>
+      <ul>
+        <li>Python <b>3.6+, stdlib only</b> - no install.</li>
+        <li>Verified on <b>RHEL 8 / CDP 7.1.9</b>.</li>
+        <li>Read-only by default; every drop is audited.</li>
+        <li>Third-party safety <b>audit</b> + automated test harness.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Built for repeated runs</h3>
+      <ul>
+        <li>Fast filtering + cached parsing (<b>~16x</b> faster timestamps).</li>
+        <li><b>Incremental</b> re-runs (process only new log bytes).</li>
+        <li><b>Fleet fan-out</b> over SSH - no central log collection.</li>
+        <li>Batched, cached <span class="kbd">hdfs -ls</span> to spare Isilon.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 14. LIMITATIONS -->
+<section>
+  <h2>Limitations &amp; caveats</h2>
+  <ul>
+    <li><b>Scope:</b> tuned for CDP 7.1.9 / Hive 3 on-prem (RHEL 8, Isilon, MySQL). Other versions untested.</li>
+    <li><b>Orphan Cleanup needs a healthy filesystem view</b> - run when Isilon/HDFS + NameNode are healthy; the bulk guard is a backstop, not a substitute.</li>
+    <li><b>"Orphaned" &ne; "unused"</b> - tables whose data still exists are never flagged.</li>
+    <li><b>Correlation is best-effort</b> - a ranked guess with a confidence score unless client logs confirm it.</li>
+    <li><b>Logs must be readable &amp; standard</b> - parsing targets Cloudera PERFLOG + AUDIT lines; live tail reads uncompressed logs.</li>
+    <li><b>Change control</b> - back up the metastore (MySQL dump) before large cleanups.</li>
+  </ul>
+</section>
+
+<!-- 15. WORKFLOW -->
+<section>
+  <h2>A safe end-to-end workflow</h2>
+  <pre class="mermaid">
+flowchart LR
+  A["1. Monitor"] --> B["2. Report orphans<br/>(read-only)"]
+  B --> C["3. Review &amp; trim CSV"]
+  C --> D["4. apply --execute<br/>(type 'yes')"]
+  D --> E["5. Re-monitor"]
+  </pre>
+  <p class="lead">Diagnose with the monitor &rarr; remove dead metadata with cleanup &rarr; confirm the
+     metastore got faster. Execution stays a human-reviewed step.</p>
+</section>
+
+<!-- 16. LEARN MORE -->
+<section class="center">
+  <h2>Where to learn more</h2>
+  <p class="lead">The repository <b>README</b> files are the comprehensive guide.</p>
+  <table style="max-width:900px;margin:0 auto">
+    <thead><tr><th>Doc</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td><span class="kbd">README.md</span></td><td>Overview, which-tool, systems, safety model, caveats.</td></tr>
+      <tr><td><span class="kbd">orphan-cleanup/README.md</span></td><td>Detection, safety gates, options, scheduling.</td></tr>
+      <tr><td><span class="kbd">pressure-monitor/README.md</span></td><td>Pipeline, fan-out, correlation, findings catalog.</td></tr>
+      <tr><td><span class="kbd">AUDIT.md</span></td><td>Third-party safety &amp; compatibility audit.</td></tr>
+    </tbody>
+  </table>
+  <p class="small" style="margin-top:.6em">Start read-only:
+    <span class="kbd">report --paths /var/log/hive --last 24h</span> &nbsp;/&nbsp;
+    <span class="kbd">report --jdbc-url ... --output-dir ./out</span></p>
+</section>
+
+</div></div>
+
+<div class="footer">hive-tools &bull; overview deck</div>
+
+<!-- mermaid first (renders while slides are visible), then reveal -->
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  import Reveal from 'https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.esm.js';
+
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'loose',
+    theme: 'neutral',
+    flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' }
+  });
+
+  // Render every .mermaid block BEFORE Reveal hides non-active slides
+  // (mermaid can't measure text inside display:none containers).
+  try {
+    await mermaid.run({ querySelector: '.mermaid' });
+  } catch (e) {
+    console.error('mermaid render error:', e);
+  }
+
+  const deck = new Reveal({
+    hash: true,
+    slideNumber: 'c/t',
+    width: 1280,
+    height: 720,
+    margin: 0.05,
+    center: false,
+    transition: 'slide'
+  });
+  deck.initialize();
+</script>
+</body>
+</html>

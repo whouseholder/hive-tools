@@ -12,6 +12,11 @@ dependency-free Python tools:
 Both are **Python 3.6+ and use only the standard library** - no `pip install`,
 no virtualenv required. Copy a script to an edge node and run it.
 
+> **New here?** Open the overview slide deck at
+> [`docs/slides.html`](docs/slides.html) in a browser for a 5-minute tour (why
+> the tools exist, what they do, and their limits). These READMEs are the
+> comprehensive guide.
+
 ---
 
 ## The problem these tools solve
@@ -176,8 +181,11 @@ There is nothing to install. See [`requirements.txt`](requirements.txt).
 ```
 hive-tools/
 ├── README.md                     # this file
+├── AUDIT.md                      # third-party safety & compatibility audit
 ├── requirements.txt              # (documents: no third-party deps)
 ├── .gitignore
+├── docs/
+│   └── slides.html               # overview slide deck (open in a browser)
 ├── orphan-cleanup/
 │   ├── hive_orphan_cleanup.py    # the tool
 │   └── README.md                 # full guide
