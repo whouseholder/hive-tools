@@ -22,6 +22,48 @@ Built for repeated, low-latency runs:
   so each HMS node parses its **own** logs locally and returns a small JSON
   aggregate; the edge node merges them into one consolidated report.
 
+## The problem
+
+The HMS backs onto a single MySQL database, and **every** metastore API call is
+a round trip to it. A handful of badly-shaped workloads - unfiltered
+`get_partitions`, per-task delegation-token fetches, `MSCK`/add-partition loops,
+statistics storms - can flood the HMS with calls and make metadata operations
+slow for *the entire cluster*. The raw logs show the flood but not the culprit.
+This tool reads those logs and answers **what is hammering the metastore, who or
+what is responsible, and how to fix it** - without connecting to the cluster.
+
+```mermaid
+flowchart LR
+    W["Badly-shaped workloads<br/>(loops, no pruning, token churn)"] --> C["Excessive HMS API calls"]
+    C --> DB[("MySQL metastore<br/>= single bottleneck")]
+    DB --> S["Slow metadata ops<br/>for everyone"]
+    M["metadata_pressure_monitor.py"] -. "reads logs, attributes load,<br/>prescribes fixes" .-> C
+```
+
+## When to use it (and when not)
+
+**Use it when:**
+
+- Metadata operations are slow, or MySQL/HMS CPU/connections are high, and you
+  need to know **why** and **who**.
+- You want to attribute load to **Hive operations** (`DROP PARTITION`,
+  `ALTER TABLE`, ...) and, where possible, to specific **queries/apps**.
+- You want a scheduled early-warning alert when a pressure pattern reappears.
+
+**Not the right tool when:**
+
+- You need to remove stale metadata rows - that's
+  [Orphan Cleanup](../orphan-cleanup/).
+- You want it to *apply* fixes: it only **recommends** config/DML changes
+  (batching, pruning, token store, stats), it never changes the cluster.
+- Your HMS logs aren't retained or are heavily customized - parsing targets
+  standard Cloudera PERFLOG + AUDIT lines.
+
+**Caveats:** source attribution without client logs is a **ranked guess with a
+confidence score** (HMS audit shares no id with HS2); the live `monitor` mode
+tails **uncompressed** logs only; and the incremental store is a cache you can
+delete anytime. See [confidence scoring](#confidence-how-sure-is-a-match) below.
+
 ## What it answers
 
 - Which HMS methods dominate **call volume** and **total time**?
@@ -60,13 +102,58 @@ Cloudera HMS role logs (`hadoop-cmf-hive-HIVEMETASTORE-<host>.log.out...`) or
 The HMS hostname is read from the log filename for fleet attribution; the
 Kerberos principal is split into short user / principal / realm.
 
+## How it connects (systems & data flow)
+
+Strictly **read-only**: it reads log files (optionally over SSH) and writes
+reports/alerts. It never connects to HMS, MySQL, or HiveServer2.
+
+```mermaid
+flowchart LR
+    subgraph Edge["Edge node"]
+        PM["metadata_pressure_monitor.py"]
+    end
+    L["HMS role logs<br/>PERFLOG + AUDIT"] --> PM
+    subgraph Fleet["Optional: all HMS nodes"]
+        AG["agg worker<br/>parses local logs"]
+    end
+    PM -. "SSH (--hosts)" .-> AG
+    AG -. "small JSON aggregate" .-> PM
+    CL["Optional: HS2 / YARN / Spark logs"] -. "correlation" .-> PM
+    PM --> RPT["report: TXT + JSON + CSVs"]
+    PM --> AL["monitor: stdout + email alerts"]
+    PM --> ST[("--state-dir<br/>incremental cache")]
+```
+
+Inside a single run, each log line flows through a cheap-to-expensive pipeline
+so most lines are discarded before any regex work:
+
+```mermaid
+flowchart TD
+    D["Discover files<br/>(dirs / globs / .gz)"] --> PR["Prune by mtime<br/>(skip files outside window)"]
+    PR --> SK["Binary-seek to window start<br/>(large plain logs)"]
+    SK --> GT["Cheap substring gate<br/>(&lt;/PERFLOG or .audit:)"]
+    GT --> PS["Fast parse<br/>ts + method / ugi / ip / table"]
+    PS --> AG["Aggregate<br/>counts, timers, per-bucket, top-N, loops"]
+    AG --> DE["Detectors → findings + fixes"]
+    AG --> CO["Correlate<br/>method → operation → source"]
+    DE --> RP["Reporter: TXT / JSON / CSV"]
+    CO --> RP
+```
+
+- With **`--state-dir`**, the `D → PS` stages run only over the **new bytes**
+  appended since the last run (offsets keyed by inode+size).
+- With **`--hosts`**, the `D → AG` stages run **on each HMS node** (`agg` mode)
+  and the edge merges the JSON aggregates before `DE`/`CO`.
+
 ## Modes
 
-| Mode      | Purpose                                                     | Writes |
-|-----------|-------------------------------------------------------------|--------|
-| `report`  | Ad-hoc analysis of historical logs (single node, gz ok). Can fan out over SSH (`--hosts`) and re-run incrementally (`--state-dir`). | TXT + JSON + CSVs |
-| `monitor` | Scheduled incremental tail with de-duplicated alerts.       | stdout + optional email + state |
-| `agg`     | Worker mode: parse local logs and emit one JSON aggregate on stdout. Normally invoked **for** you by `report --hosts` over SSH; can also be run by hand on a node. | JSON (stdout) |
+| Mode      | Purpose | Typical cadence | Reads | Writes | Mutates? |
+|-----------|---------|-----------------|-------|--------|----------|
+| `report`  | Analyze historical logs over a window. Can fan out over SSH (`--hosts`) and re-run incrementally (`--state-dir`). | Ad-hoc / hourly / daily | plain + `.gz` | TXT + JSON + CSVs | No |
+| `monitor` | Incrementally tail live logs and emit de-duplicated alerts. | Every N min (cron or loop) | plain only (live tail) | stdout + email + state | No |
+| `agg`     | Worker: parse local logs, emit one JSON aggregate on stdout. Normally invoked **for** you by `report --hosts`. | Invoked per fan-out | plain + `.gz` | JSON (stdout) | No |
+
+All three modes are **read-only** - they never connect to or change the cluster.
 
 ### report outputs (in `--output-dir`)
 
@@ -174,6 +261,35 @@ Two report sections turn "which method is hot" into "who/what to go fix":
   A source is only marked `CONFIRMED` when a client query/app is matched on
   table **and** time window; otherwise you get the percentage. Full detail lands
   in `correlation_<ts>.csv`.
+
+### Confidence: how sure is a match?
+
+Attribution is deliberately honest. With HMS logs alone the tool can see the
+`user` and `table` on each audit line but not which query/app issued it, so it
+reports a **ranked guess**. Client logs add the missing link:
+
+```mermaid
+flowchart TD
+    M["Hot HMS method"] --> OP["Map to Hive operation<br/>e.g. drop_partition → DROP PARTITION"]
+    OP --> SRC["Attribute by user + table<br/>(observed on the AUDIT line)"]
+    SRC --> HAS{"Client logs provided?<br/>(HS2 / YARN / Spark)"}
+    HAS -->|"no"| G["Ranked GUESS<br/>confidence &lt; 100%"]
+    HAS -->|"yes"| MT{"Matched on table<br/>AND time window?"}
+    MT -->|"no match"| G
+    MT -->|"matched"| B["LIKELY: boosted %<br/>+ queryId / appId attached"]
+    B --> U{"Single unambiguous<br/>driver of the operation?"}
+    U -->|"yes"| CF["CONFIRMED (100%)"]
+    U -->|"no"| B
+```
+
+| Evidence available | Confidence | Shown in report as |
+|--------------------|------------|--------------------|
+| `user` + `table` from HMS audit only | Ranked, capped **< 100%** | `NN%` (guess) |
+| + client op matched on table **and** time | Higher `%` | `NN%` + `queryId`/`appId` |
+| Single unambiguous driver of the operation | **100%** | `CONFIRMED` |
+
+The report lists up to the **Top-5** sources per operation, best confidence
+first, so you always have ranked leads even when nothing is fully confirmed.
 
 ## Configuration
 

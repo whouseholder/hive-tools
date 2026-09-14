@@ -10,6 +10,46 @@ object cascades away its rows in the metastore backing tables
 (`TBLS`/`PARTITIONS`/`SDS`/`SERDE_PARAMS`/`PARTITION_PARAMS`/`PART_COL_STATS`,
 ...) - which is how it reduces object count on the MySQL side.
 
+## The problem
+
+When data is removed straight off storage - an Isilon/HDFS `rm`, an expired
+dataset, a decommissioned external path - Hive's metadata is **not** cleaned up
+with it. The `TBLS`/`PARTITIONS`/`SDS`/... rows linger in MySQL as **orphans**.
+Over months these accumulate into millions of dead rows that slow every query
+plan, metastore backup, and CDP upgrade. This tool finds those orphans (metadata
+with a genuinely missing `LOCATION`) and removes just the metadata, safely.
+
+```mermaid
+flowchart LR
+    D["Data deleted on storage<br/>(rm / expiry / external path gone)"] --> O["HMS metadata left behind<br/>= ORPHAN rows in MySQL"]
+    O --> B["Row bloat → slow plans,<br/>backups, upgrades"]
+    T["hive_orphan_cleanup.py"] -. "DROP via Hive DML" .-> O
+```
+
+## When to use it (and when not)
+
+**Use it when:**
+
+- You know data was deleted/expired on Isilon/HDFS outside Hive and want the
+  stale metadata gone.
+- MySQL row counts (`TBLS`/`PARTITIONS`) are large and metastore ops feel slow.
+- You want a **read-only inventory** of orphaned objects before deciding.
+
+**Do not use it (or use with care) when:**
+
+- **Storage is unhealthy.** If Isilon/HDFS or the NameNode is degraded,
+  everything can look "missing." Wait until healthy; the bulk guard is only a
+  backstop.
+- **You want to find *unused* tables.** Orphan = storage genuinely gone. A table
+  whose data still exists is never flagged, however idle.
+- **You need to reclaim disk.** This removes *metadata*, not data (the data is
+  already gone). Use it to shrink the metastore, not the filesystem.
+
+**Caveats:** MANAGED-table cleanup deletes data and is opt-in (`--allow-managed`);
+ACID tables are never dropped; `MSCK ... DROP PARTITIONS` (`--use-msck`) can drop
+many partitions on a transient outage - prefer the default explicit drops. See
+[Safety model](#safety-model) below.
+
 ## Requirements
 
 - A CDP 7.1.9 edge/gateway node with `beeline` and `hdfs` on `PATH`.
@@ -74,6 +114,76 @@ Options may be given after the subcommand (e.g. `report --jdbc-url ...`).
    relies on that alone (unless you explicitly pass `--no-require-parent-exists`).
    Any indeterminate result - unreachable parent, transient Isilon/NameNode
    error - is **skipped**, so an outage cannot manufacture orphans.
+
+### Systems & data flow
+
+```mermaid
+flowchart LR
+    subgraph Edge["CDP edge node"]
+        T["hive_orphan_cleanup.py"]
+    end
+    T -->|"beeline: enumerate sys.* / SHOW"| HS2["HiveServer2"]
+    HS2 --> HMS["Hive Metastore"] --> DB[("MySQL")]
+    T -->|"hdfs dfs -ls (read-only)"| ISI[("Isilon / HDFS")]
+    T ==>|"DROP DML (only with --execute)"| HS2
+    T --> OUT["orphans_*.csv / .json<br/>summary_*.txt / audit_*.log"]
+```
+
+Thin arrow = read-only; **thick arrow = the only mutating path** (Hive DML,
+`--execute` only). No raw `DELETE` is ever issued against MySQL.
+
+### Detection decision (per object)
+
+Conservative by construction - an object is flagged only with **positive proof
+of absence**; anything uncertain is left alone:
+
+```mermaid
+flowchart TD
+    S["Enumerate locations<br/>(group by parent dir)"] --> L["List each parent ONCE<br/>hdfs dfs -ls (parallel, cached)"]
+    L --> C{"Parent listed OK?"}
+    C -->|"no — transient / outage"| SKIP["SKIP: indeterminate<br/>(never dropped)"]
+    C -->|"yes"| P{"Object present<br/>in the listing?"}
+    P -->|"yes"| KEEP["Not an orphan"]
+    P -->|"no"| ORPH["Flag ORPHAN<br/>(proven missing)"]
+```
+
+## Safety model
+
+Before anything is dropped, an object passes through a fixed **ordered set of
+gates**. Each gate is conservative by default; the override for one gate never
+weakens the others.
+
+```mermaid
+flowchart TD
+    O["Orphans detected / loaded from report"] --> RV["Re-verify vs storage<br/>(positive proof of absence)"]
+    RV --> TYPE{"Table type?"}
+    TYPE -->|"ACID / transactional"| ACID["NEVER drop<br/>(hard rule, not overridable)"]
+    TYPE -->|"MANAGED"| MGD{"--allow-managed?"}
+    MGD -->|"no (default)"| SKIPM["SKIP<br/>(dropping would delete data)"]
+    MGD -->|"yes"| BULK
+    TYPE -->|"EXTERNAL"| BULK{"Bulk guard: over<br/>--max-drops or --max-orphan-pct?"}
+    BULK -->|"yes, and no --allow-bulk"| REFUSE["REFUSE run<br/>(looks like a storage outage)"]
+    BULK -->|"within limits"| EXEC{"--execute?"}
+    EXEC -->|"no (default)"| DRY["Print itemized plan<br/>DRY-RUN — nothing changes"]
+    EXEC -->|"yes"| CONF{"Type 'yes'<br/>(or --yes for cron)"}
+    CONF -->|"confirmed"| DROP["DROP via Hive DML<br/>+ write audit_*.log"]
+    CONF -->|"declined"| ABORT["Abort — nothing changed"]
+```
+
+### The gates, in order
+
+| # | Gate | Default (safe) | Loosen with | Loosening does **not** bypass |
+|---|------|----------------|-------------|-------------------------------|
+| 1 | Dry-run | On - prints plan, issues no DML | `--execute` | any gate below |
+| 2 | External-only | MANAGED objects skipped | `--allow-managed` (deletes data) | ACID protection |
+| 3 | ACID protection | Transactional tables never dropped | *(no override)* | - |
+| 4 | Positive proof | Parent must list AND object absent | `--no-require-parent-exists` (discouraged) | - |
+| 5 | Bulk guard | Refuse > `--max-drops` / `--max-orphan-pct` | `--allow-bulk` | external-only, ACID |
+| 6 | Typed confirmation | Must type the word `yes` | `--yes` (for non-TTY) | external-only, ACID, bulk guard |
+
+The takeaway: `--yes` only skips the *keystroke*, `--allow-bulk` only skips the
+*size* check, and `--allow-managed` only opts into *managed* objects. None of
+them can drop an ACID table or act on an indeterminate storage result.
 
 ## What the tool will and will not drop
 

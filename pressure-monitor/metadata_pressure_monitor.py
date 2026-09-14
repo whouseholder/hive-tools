@@ -40,6 +40,22 @@ Gzipped (*.gz) and plain files are both supported, as are directories
 filename when present (...HIVEMETASTORE-<host>.log...).
 
 ------------------------------------------------------------------------------
+PROCESSING PIPELINE (cheap -> expensive, so most lines are dropped early)
+------------------------------------------------------------------------------
+  discover files (.gz ok)
+    -> prune by mtime         (skip whole files outside the time window)
+    -> binary-seek to start   (jump into large plain logs, no full scan)
+    -> cheap substring gate    ("</PERFLOG" or ".audit:" else discard)
+    -> fast parse             (cached ts + method / ugi / ip / table)
+    -> aggregate              (counts, timers, per-bucket, top-N, loop peaks)
+    -> detectors (findings + fixes)  +  correlation (method->operation->source)
+    -> report                 (TXT + JSON + CSVs)
+
+  --state-dir : run discover..parse over NEW bytes only (offsets by inode+size)
+  --hosts     : run discover..aggregate ON each HMS node (agg), merge on edge
+  Everything here is READ-ONLY; the tool never connects to HMS/MySQL/HS2.
+
+------------------------------------------------------------------------------
 MODES
 ------------------------------------------------------------------------------
   report    Ad-hoc. Scan historical logs (fleet-wide) over a time window and
@@ -1392,6 +1408,15 @@ def build_correlation(an, client_ops=None, top_ops_n=8, per_op=5):
       * supplying HS2/YARN/Spark logs lets us also name the likely query/app and
         raises confidence, but a specific query link caps below 100 unless the
         operation has a single unambiguous source (then 'CONFIRMED').
+
+    Confidence tiers:
+      evidence available                         | score        | reported as
+      -------------------------------------------+--------------+--------------
+      user+table from HMS audit only             | ranked, <100 | "NN%" (guess)
+      + client op matched on table AND time      | boosted %    | "NN%" + qid/app
+      single unambiguous driver of the operation | 100          | "CONFIRMED"
+
+    Returns up to `per_op` sources per operation, highest confidence first.
     """
     total = an.total_audit or 1
     index = _index_client_ops(client_ops) if client_ops else None

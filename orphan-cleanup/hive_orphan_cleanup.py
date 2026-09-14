@@ -20,6 +20,19 @@ uses only the Python standard library. Kerberos is expected to be handled by an
 existing ticket (kinit) or an optional `--keytab`/`--principal` pre-run kinit.
 
 ------------------------------------------------------------------------------
+DATA FLOW (only the DROP path mutates, and only with --execute)
+------------------------------------------------------------------------------
+    hive_orphan_cleanup.py  (edge node)
+      |
+      |-- beeline ------> HiveServer2 --> Hive Metastore --> MySQL
+      |     read : enumerate objects (sys.* views, else SHOW/DESCRIBE)
+      |     write: DROP TABLE / DROP PARTITION         [ONLY with --execute]
+      |
+      '-- hdfs dfs -ls -> Isilon / HDFS                [read-only existence]
+
+    outputs: orphans_*.csv / orphans_*.json / summary_*.txt / audit_*.log
+
+------------------------------------------------------------------------------
 MODES
 ------------------------------------------------------------------------------
   report   Read-only. Enumerate HMS objects, check Isilon, write CSV/JSON/summary.
@@ -44,6 +57,17 @@ SAFETY MODEL (conservative by default; designed for production)
   * NOTIFY + CONFIRM: before any execute, an itemized plan is printed and you
     must type the whole word 'yes' (or pass --yes for automation). --confirm-each
     prompts per table. Every statement is recorded to an audit log.
+
+  GATE ORDER (an object must clear EVERY gate; loosening one never weakens the
+  rest). ACID protection and positive-proof have no override at all:
+
+    detect / re-verify  (positive proof of absence)
+        -> ACID?         yes ................................ NEVER drop
+        -> MANAGED?      yes & no --allow-managed ........... SKIP (data-bearing)
+        -> bulk guard    over --max-drops/pct & no --allow-bulk .. REFUSE run
+        -> --execute?    no (default) ...................... DRY-RUN (plan only)
+        -> type 'yes'?   (or --yes)  no .................... ABORT (no change)
+        -> DROP via standard Hive DML  +  append to audit_*.log
 
 ------------------------------------------------------------------------------
 QUICK EXAMPLES (recommended workflow: report -> review -> apply)
@@ -1110,6 +1134,16 @@ def fetch_transactional_tables(hive):
     return acid
 
 
+# ----------------------------------------------------------------------------
+# Safety gates (applied in order; see the GATE ORDER diagram in the module
+# docstring). The gates are intentionally split so each is independently
+# testable:
+#   split_actionable()    -> ACID / VIEW / MANAGED filtering        (gates 2-3)
+#   bulk_guard()          -> refuse suspiciously large sets         (gate 5)
+#   confirm_destructive() -> require the typed word 'yes'           (gate 6)
+# Dry-run (gate 1) and positive-proof (gate 4) are enforced by the caller and
+# the Detector respectively.
+# ----------------------------------------------------------------------------
 def split_actionable(orphans, acid_set, allow_managed):
     """Split orphans into (actionable, skipped) using conservative rules.
 
