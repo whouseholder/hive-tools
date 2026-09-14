@@ -31,8 +31,8 @@
   .yes-danger { color: var(--warn); font-weight: 700; }
 
   /* diagrams */
-  .reveal .mermaid { text-align: center; margin: .1em 0; }
-  .reveal .mermaid svg { max-height: 430px; height: auto; width: auto; max-width: 100%; }
+  .reveal .mermaid, .reveal .mermaid-done { text-align: center; margin: .1em 0; }
+  .reveal .mermaid svg, .reveal .mermaid-done svg { max-height: 430px; height: auto; width: auto; max-width: 100%; }
 
   /* layout helpers */
   .cols { display: flex; gap: 28px; align-items: flex-start; }
@@ -196,7 +196,7 @@ flowchart LR
     <div>
       <pre class="mermaid">
 flowchart TD
-  S["List parent dir once<br/>(hdfs -ls, cached)"] --> C{"Parent listed OK?"}
+  S["List parent dir once (cached hdfs -ls)"] --> C{"Parent listed OK?"}
   C -->|"no - transient"| SKIP["SKIP: indeterminate"]
   C -->|yes| P{"Object present?"}
   P -->|yes| KEEP["Not an orphan"]
@@ -367,9 +367,9 @@ flowchart TD
   <h2>A safe end-to-end workflow</h2>
   <pre class="mermaid">
 flowchart LR
-  A["1. Monitor"] --> B["2. Report orphans<br/>(read-only)"]
-  B --> C["3. Review &amp; trim CSV"]
-  C --> D["4. apply --execute<br/>(type 'yes')"]
+  A["1. Monitor"] --> B["2. Report orphans (read-only)"]
+  B --> C["3. Review and trim CSV"]
+  C --> D["4. apply --execute (type 'yes')"]
   D --> E["5. Re-monitor"]
   </pre>
   <p class="lead">Diagnose with the monitor &rarr; remove dead metadata with cleanup &rarr; confirm the
@@ -398,7 +398,12 @@ flowchart LR
 
 <div class="footer">hive-tools &bull; overview deck</div>
 
-<!-- mermaid first (renders while slides are visible), then reveal -->
+<!-- Render diagrams first, then start reveal.
+     reveal.css hides non-active slides, and mermaid cannot measure text inside
+     a hidden container. So instead of mermaid.run() (which renders in-place in
+     the hidden slide), we call mermaid.render() per block: it measures against
+     a temporary node on document.body and returns an SVG string we inject. This
+     renders every slide's diagram correctly regardless of slide visibility. -->
 <script type="module">
   import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
   import Reveal from 'https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.esm.js';
@@ -410,12 +415,19 @@ flowchart LR
     flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' }
   });
 
-  // Render every .mermaid block BEFORE Reveal hides non-active slides
-  // (mermaid can't measure text inside display:none containers).
-  try {
-    await mermaid.run({ querySelector: '.mermaid' });
-  } catch (e) {
-    console.error('mermaid render error:', e);
+  const blocks = Array.from(document.querySelectorAll('pre.mermaid'));
+  for (let i = 0; i < blocks.length; i++) {
+    const el = blocks[i];
+    const code = el.textContent.trim();
+    try {
+      const { svg } = await mermaid.render('mmd_' + i, code);
+      el.innerHTML = svg;
+      el.classList.remove('mermaid');           // don't let anything re-process it
+      el.classList.add('mermaid-done');
+    } catch (e) {
+      console.error('mermaid render error in block', i, e);
+      el.innerHTML = '<span style="color:#b23b3b">diagram failed to render</span>';
+    }
   }
 
   const deck = new Reveal({
