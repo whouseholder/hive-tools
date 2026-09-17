@@ -36,6 +36,9 @@ DATA FLOW (only the DROP path mutates, and only with --execute)
 MODES
 ------------------------------------------------------------------------------
   report   Read-only. Enumerate HMS objects, check Isilon, write CSV/JSON/summary.
+           Also emits a REPORT-ONLY breakdown of *unused / stale* tables
+           (idle >= 3/6/9/12 months by last write-DDL time). Stale tables are
+           never cleaned - their storage still exists; they are not orphans.
   clean    Detect then clean. Dry-run by default; needs --execute to mutate.
   apply    Take a previously generated (optionally trimmed/edited) report and
            clean only the objects listed in it. Dry-run by default.
@@ -124,7 +127,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections import defaultdict
+import time
+from collections import defaultdict, OrderedDict
 
 try:
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -911,14 +915,30 @@ class Reporter(object):
     def _path(self, name):
         return os.path.join(self.output_dir or ".", name)
 
-    def write_all(self, orphans, stats, recommendations):
+    def write_all(self, orphans, stats, recommendations, unused=None,
+                  unused_list=40):
         csv_path = self._path("orphans_%s.csv" % self.ts)
         json_path = self._path("orphans_%s.json" % self.ts)
         summary_path = self._path("summary_%s.txt" % self.ts)
         self.write_csv(csv_path, orphans)
-        self.write_json(json_path, orphans, stats, recommendations)
-        self.write_summary(summary_path, orphans, stats, recommendations)
-        return {"csv": csv_path, "json": json_path, "summary": summary_path}
+        self.write_json(json_path, orphans, stats, recommendations, unused)
+        out = {"csv": csv_path, "json": json_path, "summary": summary_path}
+        if unused is not None:
+            unused_path = self._path("unused_tables_%s.csv" % self.ts)
+            self.write_unused_csv(unused_path, unused)
+            out["unused_csv"] = unused_path
+        self.write_summary(summary_path, orphans, stats, recommendations,
+                           unused, unused_list)
+        return out
+
+    def write_unused_csv(self, path, unused):
+        rows = unused.get("tables", [])
+        with open(path, "w") as fh:
+            writer = csv.DictWriter(fh, fieldnames=UNUSED_COLUMNS)
+            writer.writeheader()
+            for t in rows:
+                writer.writerow({k: t.get(k, "") for k in UNUSED_COLUMNS})
+        LOG.info("wrote unused-tables CSV: %s (%d rows)", path, len(rows))
 
     def write_csv(self, path, orphans):
         with open(path, "w") as fh:
@@ -928,18 +948,21 @@ class Reporter(object):
                 writer.writerow(o.to_row())
         LOG.info("wrote CSV report: %s (%d rows)", path, len(orphans))
 
-    def write_json(self, path, orphans, stats, recommendations):
+    def write_json(self, path, orphans, stats, recommendations, unused=None):
         doc = {
             "generated_at": datetime.datetime.now().isoformat(),
             "stats": stats,
             "recommendations": recommendations,
             "orphans": [o.to_row() for o in orphans],
         }
+        if unused is not None:
+            doc["unused_tables"] = unused
         with open(path, "w") as fh:
             json.dump(doc, fh, indent=2)
         LOG.info("wrote JSON report: %s", path)
 
-    def write_summary(self, path, orphans, stats, recommendations):
+    def write_summary(self, path, orphans, stats, recommendations,
+                      unused=None, unused_list=40):
         n_tables = sum(1 for o in orphans if o.object_type == OBJECT_TABLE)
         n_parts = sum(1 for o in orphans if o.object_type == OBJECT_PARTITION)
         lines = []
@@ -982,6 +1005,9 @@ class Reporter(object):
             lines.append("  %-50s %s (%d part(s))" % (key, tag, g["parts"]))
         lines.append("")
 
+        if unused is not None:
+            self._append_unused_section(lines, unused, unused_list)
+
         lines.append("RECOMMENDATIONS")
         if recommendations:
             for r in recommendations:
@@ -1000,6 +1026,45 @@ class Reporter(object):
         LOG.info("wrote summary: %s", path)
         return text
 
+    def _append_unused_section(self, lines, unused, unused_list):
+        """Render the REPORT-ONLY unused/stale-table breakdown into `lines`."""
+        known = unused.get("known", 0)
+        idle = unused.get("idle_ge_months", {})
+        bc = unused.get("bucket_counts", {})
+
+        def pct(n):
+            return " (%.1f%% of known)" % (100.0 * n / known) if known else ""
+
+        lines.append("UNUSED / STALE TABLES  (report-only; NEVER cleaned by this tool)")
+        lines.append("  Staleness proxy : %s" % unused.get("proxy", ""))
+        lines.append("  As of           : %s" % unused.get("as_of", ""))
+        lines.append("  Tables analyzed : %d  (%d with a known last-activity time, "
+                     "%d unknown)" % (unused.get("total_tables", 0), known,
+                                      unused.get("unknown", 0)))
+        for m in STALE_MONTH_THRESHOLDS:
+            n = idle.get(str(m), 0)
+            lines.append("  Idle >= %2d months : %-6d%s" % (m, n, pct(n)))
+        lines.append("  Exact buckets   : 3-6mo=%d | 6-9mo=%d | 9-12mo=%d | 12+=%d "
+                     "| <3mo=%d | unknown=%d"
+                     % (bc.get("3-6 months", 0), bc.get("6-9 months", 0),
+                        bc.get("9-12 months", 0), bc.get("12+ months", 0),
+                        bc.get("under 3 months", 0), bc.get("unknown", 0)))
+        stale = [t for t in unused.get("tables", [])
+                 if t.get("age_months") != "" and t.get("age_months", 0) >= 3]
+        if stale and unused_list:
+            shown = min(unused_list, len(stale))
+            lines.append("  Stalest tables (top %d of %d idle>=3mo; full list in "
+                         "unused_tables_%s.csv):" % (shown, len(stale), self.ts))
+            for t in stale[:unused_list]:
+                lines.append("    %-48s last=%-19s age=%5sm  [%s]"
+                             % ("%s.%s" % (t["db"], t["table"]),
+                                t.get("last_activity") or "?",
+                                t.get("age_months"), t.get("tbl_type") or "?"))
+        lines.append("  NOTE: HMS does not track reads; a 'stale' table may still be")
+        lines.append("        queried. This list is informational - it is never dropped,")
+        lines.append("        and stale tables are NOT the same as orphans (their data exists).")
+        lines.append("")
+
 
 def estimate_rows_reclaimed(orphans):
     """Rough estimate of metastore backing rows freed by dropping these objects.
@@ -1015,6 +1080,189 @@ def estimate_rows_reclaimed(orphans):
         else:
             rows += 10
     return rows
+
+
+# ----------------------------------------------------------------------------
+# Unused / stale table analysis  (REPORT-ONLY; these are NEVER cleaned)
+# ----------------------------------------------------------------------------
+# "Unused" is a *staleness* proxy. HMS does not record table READS, so we take
+# the most recent WRITE/DDL signal we can read straight from sys.*:
+#
+#     last_activity = max( transient_lastDdlTime ,     # updated on DDL + writes
+#                          table CREATE_TIME ,          # fallback if no param
+#                          newest partition CREATE_TIME )  # partitioned tables
+#
+# A table that is only ever queried will therefore look "stale" - the report
+# says so loudly. This is intentionally informational: the cleanup modes act
+# only on ORPHANS (storage genuinely gone), never on merely-idle tables.
+#
+#     age (months)          bucket           counted in "idle >= N months"
+#     -----------------     --------------   -----------------------------
+#     < 3                   under 3 months   (none)
+#     3  <= age < 6         3-6 months       >= 3
+#     6  <= age < 9         6-9 months       >= 3, >= 6
+#     9  <= age < 12        9-12 months      >= 3, >= 6, >= 9
+#     >= 12                 12+ months       >= 3, >= 6, >= 9, >= 12
+#     no usable timestamp   unknown          (none)
+
+UNUSED_COLUMNS = [
+    "db",
+    "table",
+    "tbl_type",
+    "last_activity",
+    "last_activity_source",
+    "age_days",
+    "age_months",
+    "bucket",
+]
+
+SYS_TABLE_ACTIVITY_SQL = """
+SELECT d.NAME AS db, t.TBL_NAME AS tbl, t.TBL_TYPE AS tbl_type,
+       t.CREATE_TIME AS create_time, tp.PARAM_VALUE AS last_ddl
+FROM sys.TBLS t
+JOIN sys.DBS d ON t.DB_ID = d.DB_ID
+LEFT JOIN sys.TABLE_PARAMS tp
+       ON tp.TBL_ID = t.TBL_ID AND tp.PARAM_KEY = 'transient_lastDdlTime'
+"""
+
+SYS_PART_RECENCY_SQL = """
+SELECT d.NAME AS db, t.TBL_NAME AS tbl, MAX(p.CREATE_TIME) AS max_part_create
+FROM sys.PARTITIONS p
+JOIN sys.TBLS t ON p.TBL_ID = t.TBL_ID
+JOIN sys.DBS d ON t.DB_ID = d.DB_ID
+GROUP BY d.NAME, t.TBL_NAME
+"""
+
+STALE_MONTH_THRESHOLDS = (3, 6, 9, 12)
+_DAYS_PER_MONTH = 30.436875  # average Gregorian month
+
+
+def _epoch_to_iso(epoch):
+    try:
+        dt = datetime.datetime.fromtimestamp(int(epoch))
+    except (ValueError, OverflowError, OSError, TypeError):
+        return ""
+    try:
+        return dt.isoformat(timespec="seconds")
+    except TypeError:
+        return dt.isoformat()
+
+
+def _as_epoch(val):
+    """Parse a metastore epoch-seconds value (str/int) to a positive int, else None."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        n = int(float(s))
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+def stale_bucket_label(age_months):
+    if age_months is None:
+        return "unknown"
+    if age_months >= 12:
+        return "12+ months"
+    if age_months >= 9:
+        return "9-12 months"
+    if age_months >= 6:
+        return "6-9 months"
+    if age_months >= 3:
+        return "3-6 months"
+    return "under 3 months"
+
+
+def analyze_unused_tables(hive, filters, now_epoch=None):
+    """Return a REPORT-ONLY staleness breakdown of tables, read from sys.*.
+
+    Raises CommandError if the base activity query fails (the caller decides
+    whether to skip the section). The partition-recency enrichment is
+    best-effort and silently degrades if sys.PARTITIONS is unavailable.
+    """
+    now_epoch = now_epoch if now_epoch is not None else time.time()
+    rows = hive.query(_where_clause(SYS_TABLE_ACTIVITY_SQL, filters))
+
+    # (db, table) -> [epoch, source, tbl_type]
+    activity = {}
+    for r in rows:
+        db = (r.get("db") or "").strip()
+        tbl = (r.get("tbl") or "").strip()
+        if not tbl or not filters.accept(db, tbl):
+            continue
+        tbl_type = (r.get("tbl_type") or "").strip()
+        ddl = _as_epoch(r.get("last_ddl"))
+        create = _as_epoch(r.get("create_time"))
+        if ddl is not None:
+            epoch, source = ddl, "transient_lastDdlTime"
+        elif create is not None:
+            epoch, source = create, "CREATE_TIME"
+        else:
+            epoch, source = None, "unknown"
+        activity[(db, tbl)] = [epoch, source, tbl_type]
+
+    # Best-effort: a newer partition CREATE_TIME wins (a partitioned table often
+    # keeps an old table-level lastDdl while still receiving fresh partitions).
+    try:
+        precs = hive.query(SYS_PART_RECENCY_SQL)
+    except CommandError as exc:
+        LOG.debug("partition-recency enrichment skipped: %s", _first_line(str(exc)))
+        precs = []
+    for r in precs:
+        key = ((r.get("db") or "").strip(), (r.get("tbl") or "").strip())
+        if key not in activity:
+            continue
+        pc = _as_epoch(r.get("max_part_create"))
+        if pc is None:
+            continue
+        if activity[key][0] is None or pc > activity[key][0]:
+            activity[key][0] = pc
+            activity[key][1] = "partition CREATE_TIME"
+
+    tables = []
+    for (db, tbl), (epoch, source, tbl_type) in activity.items():
+        if epoch is None:
+            age_days = age_months = ""
+            bucket = "unknown"
+            iso = ""
+        else:
+            age_days = int(round(max(0.0, (now_epoch - epoch) / 86400.0)))
+            age_months = round(age_days / _DAYS_PER_MONTH, 1)
+            bucket = stale_bucket_label(age_months)
+            iso = _epoch_to_iso(epoch)
+        tables.append({
+            "db": db, "table": tbl, "tbl_type": tbl_type,
+            "last_activity": iso, "last_activity_source": source,
+            "age_days": age_days, "age_months": age_months, "bucket": bucket,
+        })
+
+    # Oldest first; unknown ages sink to the bottom.
+    tables.sort(key=lambda t: (0, -t["age_days"]) if t["age_days"] != "" else (1, 0))
+
+    known = [t for t in tables if t["age_days"] != ""]
+    idle_ge = {m: sum(1 for t in known if t["age_months"] >= m)
+               for m in STALE_MONTH_THRESHOLDS}
+    bucket_counts = OrderedDict((lbl, 0) for lbl in (
+        "under 3 months", "3-6 months", "6-9 months", "9-12 months",
+        "12+ months", "unknown"))
+    for t in tables:
+        bucket_counts[t["bucket"]] += 1
+
+    return {
+        "as_of": _epoch_to_iso(now_epoch),
+        "proxy": ("last write/DDL time (max of transient_lastDdlTime, table "
+                  "CREATE_TIME, newest partition CREATE_TIME); HMS does not "
+                  "record reads, so read-only tables appear stale"),
+        "total_tables": len(tables),
+        "known": len(known),
+        "unknown": len(tables) - len(known),
+        "idle_ge_months": {str(k): v for k, v in idle_ge.items()},
+        "bucket_counts": bucket_counts,
+        "tables": tables,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -1521,6 +1769,13 @@ def build_parser():
     # report
     sp_report = sub.add_parser("report", parents=[shared],
                                help="Read-only: find orphans, write reports")
+    sp_report.add_argument("--no-unused-report", action="store_true",
+                           help="Skip the report-only unused/stale-table breakdown "
+                                "(idle >= 3/6/9/12 months by last write/DDL time).")
+    sp_report.add_argument("--unused-list", type=int, default=40, metavar="N",
+                           help="How many of the stalest tables to list in the "
+                                "summary (the full list is always written to "
+                                "unused_tables_*.csv; default 40).")
     _add_housekeeping_flags(sp_report, executable=False)
 
     # clean
@@ -1648,7 +1903,21 @@ def run_report(args):
         "orphaned_partitions": sum(1 for o in orphans if o.object_type == OBJECT_PARTITION),
         "estimated_mysql_rows_reclaimed": estimate_rows_reclaimed(orphans),
     }
-    paths = reporter.write_all(orphans, stats, recs)
+    unused = None
+    if not getattr(args, "no_unused_report", False):
+        try:
+            unused = analyze_unused_tables(hive, filters)
+            ig = unused["idle_ge_months"]
+            LOG.info("unused/stale tables: idle>=3mo=%s, >=6mo=%s, >=9mo=%s, "
+                     ">=12mo=%s (of %d known; %d unknown)",
+                     ig["3"], ig["6"], ig["9"], ig["12"],
+                     unused["known"], unused["unknown"])
+        except CommandError as exc:
+            LOG.warning("unused-table analysis skipped (sys.* query failed: %s)",
+                        _first_line(str(exc)))
+
+    paths = reporter.write_all(orphans, stats, recs, unused=unused,
+                               unused_list=getattr(args, "unused_list", 40))
     LOG.info("REPORT COMPLETE: %d orphaned objects (%d tables, %d partitions)",
              len(orphans), stats["orphaned_tables"], stats["orphaned_partitions"])
     LOG.info("reports: %s", ", ".join(paths.values()))
